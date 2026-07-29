@@ -4,14 +4,30 @@ import streamlit as st
 from content import THEMES
 
 
-def inject_css(theme_name: str):
-    theme = THEMES.get(theme_name, THEMES["Neon Megacity"])
+def inject_css(theme_name: str, font_size: str = "Medium", high_contrast: bool = False,
+                reduced_motion: bool = False, colorblind_mode: bool = False,
+                layout_density: str = "Spacious"):
+    theme = dict(THEMES.get(theme_name, THEMES["Neon Megacity"]))
+
+    if colorblind_mode:
+        # Okabe-Ito palette accents — safe for the common forms of color blindness.
+        theme["accent"] = "#0072B2"
+        theme["accent2"] = "#E69F00"
+
+    if high_contrast:
+        theme["text"] = "#ffffff"
+        theme["gradient"] = "linear-gradient(135deg,#000000 0%,#0a0a0a 100%)"
+
+    font_scale = {"Small": "0.9", "Medium": "1.0", "Large": "1.15", "Extra Large": "1.3"}.get(font_size, "1.0")
+    card_padding = "0.9rem 1.1rem" if layout_density == "Compact" else "1.3rem 1.5rem"
+    anim = "none" if reduced_motion else None
     css = f"""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Fraunces:ital,wght@0,500;0,700;1,500&display=swap');
 
     html, body, [class*="css"] {{
         font-family: 'Manrope', -apple-system, BlinkMacSystemFont, sans-serif;
+        font-size: calc(1rem * {font_scale});
     }}
 
     .stApp {{
@@ -43,13 +59,13 @@ def inject_css(theme_name: str):
         -webkit-backdrop-filter: blur(16px);
         border: 1px solid rgba(255,255,255,0.14);
         border-radius: 20px;
-        padding: 1.3rem 1.5rem;
+        padding: {card_padding};
         margin-bottom: 1rem;
         box-shadow: 0 8px 32px rgba(0,0,0,0.25);
-        transition: transform 0.25s ease, box-shadow 0.25s ease;
+        transition: {'none' if reduced_motion else 'transform 0.25s ease, box-shadow 0.25s ease'};
     }}
     .ff-card:hover {{
-        transform: translateY(-3px);
+        transform: {'none' if reduced_motion else 'translateY(-3px)'};
         box-shadow: 0 12px 40px rgba(0,0,0,0.35);
     }}
 
@@ -124,10 +140,10 @@ def inject_css(theme_name: str):
         color: #0b0b0f;
         font-weight: 700;
         padding: 0.5rem 1.1rem;
-        transition: transform .15s ease;
+        transition: {'none' if reduced_motion else 'transform .15s ease'};
     }}
     div.stButton > button:hover {{
-        transform: translateY(-2px) scale(1.02);
+        transform: {'none' if reduced_motion else 'translateY(-2px) scale(1.02)'};
     }}
 
     [data-testid="stMetricValue"] {{
@@ -137,7 +153,7 @@ def inject_css(theme_name: str):
 
     .streak-flame {{
         font-size: 2.6rem;
-        animation: flicker 1.6s infinite alternate;
+        animation: {'none' if reduced_motion else 'flicker 1.6s infinite alternate'};
     }}
     @keyframes flicker {{
         0% {{ transform: scale(1) rotate(-2deg); opacity: 0.9; }}
