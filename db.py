@@ -1,53 +1,31 @@
 """
-Fluent Forest: German — data layer
-All persistence is done via a local SQLite file (fluent_forest.db).
-This module is intentionally free of any Streamlit imports so it can be
-unit-tested / reused on its own.
+Fluent Forest RPG — data layer.
+Everything persists to SQLite (fluent_forest_rpg.db). No Streamlit imports here
+so this module can be tested standalone.
 """
 
 import sqlite3
 import datetime as dt
+import json
 from contextlib import contextmanager
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "fluent_forest.db"
-
-CATEGORIES = [
-    "Reading", "Listening", "Watching (YouTube)", "Podcasts", "Movies/TV",
-    "Speaking", "Flashcards", "Grammar", "Writing", "Other",
-]
-
-DIFFICULTIES = ["Very Easy", "Easy", "Comfortable", "Challenging", "Very Hard"]
-
-MILESTONES_HOURS = [10, 25, 50, 100, 250, 500, 750, 1000, 1500, 2000]
+DB_PATH = Path(__file__).parent / "fluent_forest_rpg.db"
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT NOT NULL,              -- ISO date, e.g. 2026-07-28
-    category TEXT NOT NULL,
-    minutes REAL NOT NULL,
-    difficulty TEXT,
-    resource TEXT,
-    notes TEXT,
-    created_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS profile (
     key TEXT PRIMARY KEY,
     value TEXT
 );
 
-CREATE TABLE IF NOT EXISTS saved_words (
+CREATE TABLE IF NOT EXISTS inventory (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    word TEXT NOT NULL,
-    base_form TEXT,
-    meaning TEXT,
-    gender TEXT,
-    plural TEXT,
-    example TEXT,
-    collection TEXT DEFAULT 'General',
-    added_at TEXT NOT NULL
+    item_id TEXT NOT NULL,
+    item_type TEXT NOT NULL,     -- theme, avatar_hair, avatar_clothes, avatar_bg, avatar_frame, pet, title, decoration, xp_effect
+    rarity TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    acquired_via TEXT,           -- shop, chest, achievement
+    UNIQUE(item_id)
 );
 
 CREATE TABLE IF NOT EXISTS achievements_unlocked (
@@ -55,82 +33,110 @@ CREATE TABLE IF NOT EXISTS achievements_unlocked (
     unlocked_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS daily_challenges (
+CREATE TABLE IF NOT EXISTS vocabulary (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    word TEXT NOT NULL,
+    meaning TEXT NOT NULL,
+    gender TEXT,
+    example TEXT,
+    tag TEXT DEFAULT 'General',
+    favorite INTEGER DEFAULT 0,
+    srs_state TEXT DEFAULT 'New',   -- New, Learning, Review, Mastered
+    ease REAL DEFAULT 2.5,
+    interval_days REAL DEFAULT 0,
+    repetitions INTEGER DEFAULT 0,
+    due_date TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    UNIQUE(word)
+);
+
+CREATE TABLE IF NOT EXISTS quiz_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    quiz_type TEXT NOT NULL,      -- vocabulary, grammar, article, verb, listening, reading
+    category TEXT,
+    score INTEGER NOT NULL,
+    total INTEGER NOT NULL,
+    xp_earned INTEGER NOT NULL,
     date TEXT NOT NULL,
-    difficulty TEXT NOT NULL,
-    title TEXT NOT NULL,
-    description TEXT,
-    xp_reward INTEGER NOT NULL,
-    completed INTEGER NOT NULL DEFAULT 0,
-    completed_at TEXT,
-    UNIQUE(date, difficulty)
+    created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS favorites (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    item_type TEXT NOT NULL,
-    title TEXT NOT NULL,
-    url TEXT,
-    notes TEXT,
-    added_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS resource_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    resource_id TEXT NOT NULL,
-    shown_at TEXT NOT NULL,
-    completed INTEGER NOT NULL DEFAULT 0,
+CREATE TABLE IF NOT EXISTS story_progress (
+    story_id TEXT PRIMARY KEY,
+    completed INTEGER DEFAULT 0,
+    comprehension_score INTEGER,
     completed_at TEXT
 );
 
-CREATE TABLE IF NOT EXISTS study_notes (
+CREATE TABLE IF NOT EXISTS daily_login (
+    date TEXT PRIMARY KEY,
+    reward_json TEXT NOT NULL,
+    claimed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS weekly_challenges (
+    week_start TEXT NOT NULL,
+    challenge_key TEXT NOT NULL,
+    progress REAL DEFAULT 0,
+    target REAL NOT NULL,
+    completed INTEGER DEFAULT 0,
+    reward_claimed INTEGER DEFAULT 0,
+    PRIMARY KEY (week_start, challenge_key)
+);
+
+CREATE TABLE IF NOT EXISTS shop_daily (
+    date TEXT PRIMARY KEY,
+    items_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS xp_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    source TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chest_openings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chest_type TEXT NOT NULL,
+    item_won TEXT NOT NULL,
+    rarity_won TEXT NOT NULL,
+    opened_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ai_conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scenario TEXT NOT NULL,
+    role TEXT NOT NULL,          -- user / model
     content TEXT NOT NULL,
     created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS weekly_reflections (
-    week_start TEXT PRIMARY KEY,
-    report_json TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS study_plan (
-    day_of_week TEXT PRIMARY KEY,
-    activity TEXT,
-    minutes INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS timeline_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_key TEXT UNIQUE NOT NULL,
-    title TEXT NOT NULL,
-    description TEXT,
-    icon TEXT,
-    occurred_at TEXT NOT NULL
 );
 """
 
 DEFAULT_PROFILE = {
-    "display_name": "Sprachfreund",
-    "daily_goal_minutes": "30",
-    "current_theme": "Neon Megacity",
-    "unlocked_themes": "Neon Megacity",
+    "display_name": "Sprachheld",
+    "xp": "0",
+    "coins": "100",
+    "level": "1",
     "current_streak": "0",
     "longest_streak": "0",
-    "last_study_date": "",
+    "last_login_date": "",
     "streak_freeze_tokens": "1",
-    "xp": "0",
-    "font_size": "Medium",
-    "high_contrast": "0",
-    "reduced_motion": "0",
-    "colorblind_mode": "0",
-    "layout_density": "Spacious",
-    "keyboard_shortcuts": "0",
+    "dark_mode": "1",
+    "sound_enabled": "1",
+    "equipped_theme": "light",
+    "equipped_pet": "",
+    "equipped_avatar_hair": "",
+    "equipped_avatar_clothes": "",
+    "equipped_avatar_bg": "",
+    "equipped_avatar_frame": "",
+    "equipped_title": "",
+    "equipped_xp_effect": "xp_normal",
     "created_at": dt.datetime.now().isoformat(),
-    "target_cefr": "B2",
+    "common_keys": "0",
+    "uncommon_keys": "0",
+    "rare_keys": "0",
+    "legendary_keys": "0",
 }
 
 
@@ -151,12 +157,19 @@ def init_db():
         cur = conn.execute("SELECT COUNT(*) AS c FROM profile")
         if cur.fetchone()["c"] == 0:
             for k, v in DEFAULT_PROFILE.items():
-                conn.execute(
-                    "INSERT INTO profile (key, value) VALUES (?, ?)", (k, v)
-                )
+                conn.execute("INSERT INTO profile (key, value) VALUES (?, ?)", (k, v))
+        # Everyone starts owning the free/default cosmetics
+        conn.execute(
+            "INSERT OR IGNORE INTO inventory (item_id, item_type, rarity, acquired_at, acquired_via) "
+            "VALUES ('light', 'theme', 'common', ?, 'starter')", (dt.datetime.now().isoformat(),)
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO inventory (item_id, item_type, rarity, acquired_at, acquired_via) "
+            "VALUES ('xp_normal', 'xp_effect', 'common', ?, 'starter')", (dt.datetime.now().isoformat(),)
+        )
 
 
-# ---------------------------------------------------------------- profile --
+# ------------------------------------------------------------------ profile --
 def get_profile() -> dict:
     with get_conn() as conn:
         rows = conn.execute("SELECT key, value FROM profile").fetchall()
@@ -172,95 +185,70 @@ def set_profile(key: str, value):
         )
 
 
-# --------------------------------------------------------------- sessions --
-def add_session(date_str, category, minutes, difficulty, resource, notes):
+def add_xp(amount: int, source: str):
+    profile = get_profile()
+    xp = int(float(profile.get("xp", "0") or 0)) + amount
+    set_profile("xp", xp)
     with get_conn() as conn:
         conn.execute(
-            """INSERT INTO sessions
-               (date, category, minutes, difficulty, resource, notes, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                date_str, category, minutes, difficulty, resource, notes,
-                dt.datetime.now().isoformat(),
-            ),
+            "INSERT INTO xp_log (date, amount, source) VALUES (?, ?, ?)",
+            (dt.date.today().isoformat(), amount, source),
         )
-    _update_streak(date_str)
-    _award_xp(minutes)
+    return xp
 
 
-def get_all_sessions():
+def add_coins(amount: int):
+    profile = get_profile()
+    coins = int(float(profile.get("coins", "0") or 0)) + amount
+    coins = max(0, coins)
+    set_profile("coins", coins)
+    return coins
+
+
+def spend_coins(amount: int) -> bool:
+    profile = get_profile()
+    coins = int(float(profile.get("coins", "0") or 0))
+    if coins < amount:
+        return False
+    set_profile("coins", coins - amount)
+    return True
+
+
+def get_xp_log():
     import pandas as pd
     with get_conn() as conn:
-        df = pd.read_sql_query("SELECT * FROM sessions ORDER BY date DESC, id DESC", conn)
-    if not df.empty:
-        df["date"] = pd.to_datetime(df["date"])
-        df["hours"] = df["minutes"] / 60.0
-    return df
+        return pd.read_sql_query("SELECT * FROM xp_log ORDER BY date", conn)
 
 
-def delete_session(session_id: int):
+# --------------------------------------------------------------- inventory --
+def grant_item(item_id: str, item_type: str, rarity: str, via: str = "shop"):
     with get_conn() as conn:
-        conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        conn.execute(
+            "INSERT OR IGNORE INTO inventory (item_id, item_type, rarity, acquired_at, acquired_via) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (item_id, item_type, rarity, dt.datetime.now().isoformat(), via),
+        )
 
 
-# ----------------------------------------------------------------- streak --
-def _update_streak(date_str: str):
-    profile = get_profile()
-    last = profile.get("last_study_date", "")
-    today = dt.date.fromisoformat(date_str)
+def owns_item(item_id: str) -> bool:
+    with get_conn() as conn:
+        row = conn.execute("SELECT 1 FROM inventory WHERE item_id = ?", (item_id,)).fetchone()
+        return row is not None
 
-    if last == "":
-        new_streak = 1
-    else:
-        last_date = dt.date.fromisoformat(last)
-        delta = (today - last_date).days
-        if delta == 0:
-            new_streak = int(profile.get("current_streak", "1") or 1)
-        elif delta == 1:
-            new_streak = int(profile.get("current_streak", "0") or 0) + 1
-        elif delta > 1:
-            tokens = int(profile.get("streak_freeze_tokens", "0") or 0)
-            missed = delta - 1
-            if tokens >= missed:
-                set_profile("streak_freeze_tokens", tokens - missed)
-                new_streak = int(profile.get("current_streak", "0") or 0) + 1
-            else:
-                new_streak = 1
+
+def get_inventory():
+    import pandas as pd
+    with get_conn() as conn:
+        return pd.read_sql_query("SELECT * FROM inventory ORDER BY acquired_at DESC", conn)
+
+
+def owned_item_ids(item_type: str = None):
+    with get_conn() as conn:
+        if item_type:
+            rows = conn.execute("SELECT item_id FROM inventory WHERE item_type = ?", (item_type,)).fetchall()
         else:
-            # backfilled an earlier date; don't disturb streak
-            return
-
-    if last == "" or today >= dt.date.fromisoformat(last):
-        set_profile("last_study_date", date_str)
-        set_profile("current_streak", new_streak)
-        longest = int(profile.get("longest_streak", "0") or 0)
-        if new_streak > longest:
-            set_profile("longest_streak", new_streak)
-
-
-def _award_xp(minutes: float):
-    profile = get_profile()
-    xp = float(profile.get("xp", "0") or 0)
-    xp += minutes * 2  # 2 XP per minute studied
-    set_profile("xp", xp)
-
-
-def maybe_earn_streak_freeze():
-    """Award a streak-freeze token every 7-day streak milestone (idempotent-ish)."""
-    profile = get_profile()
-    streak = int(profile.get("current_streak", "0") or 0)
-    earned_key = f"freeze_earned_at_{streak}"
-    if streak > 0 and streak % 7 == 0:
-        with get_conn() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM achievements_unlocked WHERE key = ?", (earned_key,)
-            ).fetchone()
-        if not row:
-            tokens = int(profile.get("streak_freeze_tokens", "0") or 0)
-            set_profile("streak_freeze_tokens", tokens + 1)
-            unlock_achievement(earned_key)
-            return True
-    return False
+            rows = conn.execute("SELECT item_id FROM inventory").fetchall()
+        return {r["item_id"] for r in rows}
 
 
 # ------------------------------------------------------------ achievements --
@@ -278,346 +266,294 @@ def get_unlocked_achievements() -> set:
         return {r["key"] for r in rows}
 
 
-# ------------------------------------------------------------- saved_words --
-def save_word(word, base_form, meaning, gender, plural, example, collection="General"):
+# --------------------------------------------------------------- vocabulary --
+def add_vocab(word, meaning, gender="—", example="", tag="General"):
     with get_conn() as conn:
         conn.execute(
-            """INSERT INTO saved_words
-               (word, base_form, meaning, gender, plural, example, collection, added_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (word, base_form, meaning, gender, plural, example, collection,
+            """INSERT OR IGNORE INTO vocabulary
+               (word, meaning, gender, example, tag, due_date, added_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (word, meaning, gender, example, tag, dt.date.today().isoformat(),
              dt.datetime.now().isoformat()),
         )
 
 
-def get_saved_words():
+def get_vocab_df():
     import pandas as pd
     with get_conn() as conn:
-        return pd.read_sql_query("SELECT * FROM saved_words ORDER BY added_at DESC", conn)
+        return pd.read_sql_query("SELECT * FROM vocabulary ORDER BY added_at DESC", conn)
 
 
-def delete_word(word_id: int):
+def get_due_flashcards(limit=20):
+    import pandas as pd
+    today = dt.date.today().isoformat()
     with get_conn() as conn:
-        conn.execute("DELETE FROM saved_words WHERE id = ?", (word_id,))
+        df = pd.read_sql_query(
+            "SELECT * FROM vocabulary WHERE due_date <= ? ORDER BY due_date LIMIT ?",
+            conn, params=(today, limit),
+        )
+    return df
 
 
-# ------------------------------------------------------------------ totals --
-def totals():
-    df = get_all_sessions()
-    if df.empty:
-        return {
-            "total_hours": 0.0, "week_hours": 0.0, "month_hours": 0.0,
-            "today_minutes": 0.0, "sessions": 0,
-        }
+def update_flashcard_srs(word_id: int, ease: float, interval_days: float, repetitions: int,
+                          due_date: str, srs_state: str):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE vocabulary SET ease=?, interval_days=?, repetitions=?, due_date=?, srs_state=? "
+            "WHERE id=?",
+            (ease, interval_days, repetitions, due_date, srs_state, word_id),
+        )
+
+
+def toggle_favorite(word_id: int):
+    with get_conn() as conn:
+        row = conn.execute("SELECT favorite FROM vocabulary WHERE id=?", (word_id,)).fetchone()
+        if row:
+            conn.execute("UPDATE vocabulary SET favorite=? WHERE id=?", (0 if row["favorite"] else 1, word_id))
+
+
+def delete_vocab(word_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM vocabulary WHERE id=?", (word_id,))
+
+
+# --------------------------------------------------------------- quizzes --
+def record_quiz(quiz_type, category, score, total, xp_earned):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO quiz_results (quiz_type, category, score, total, xp_earned, date, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (quiz_type, category, score, total, xp_earned, dt.date.today().isoformat(),
+             dt.datetime.now().isoformat()),
+        )
+
+
+def get_quiz_results():
     import pandas as pd
-    today = dt.date.today()
-    week_start = pd.Timestamp(today - dt.timedelta(days=today.weekday()))
-    month_start = pd.Timestamp(today.replace(day=1))
-    total_hours = df["hours"].sum()
-    week_hours = df[df["date"] >= week_start]["hours"].sum()
-    month_hours = df[df["date"] >= month_start]["hours"].sum()
-    today_minutes = df[df["date"] == pd.Timestamp(today)]["minutes"].sum()
-    return {
-        "total_hours": round(total_hours, 2),
-        "week_hours": round(week_hours, 2),
-        "month_hours": round(month_hours, 2),
-        "today_minutes": round(today_minutes, 1),
-        "sessions": len(df),
-    }
+    with get_conn() as conn:
+        return pd.read_sql_query("SELECT * FROM quiz_results ORDER BY created_at DESC", conn)
 
 
-def hours_before(cutoff_date: dt.date) -> float:
-    """Total hours logged strictly before a given date — used for trend/forecast math."""
-    df = get_all_sessions()
-    if df.empty:
-        return 0.0
-    import pandas as pd
-    cut = pd.Timestamp(cutoff_date)
-    return round(df[df["date"] < cut]["hours"].sum(), 2)
+# --------------------------------------------------------------- stories --
+def mark_story_complete(story_id, comprehension_score):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO story_progress (story_id, completed, comprehension_score, completed_at)
+               VALUES (?, 1, ?, ?)
+               ON CONFLICT(story_id) DO UPDATE SET completed=1,
+                    comprehension_score=excluded.comprehension_score,
+                    completed_at=excluded.completed_at""",
+            (story_id, comprehension_score, dt.datetime.now().isoformat()),
+        )
 
 
-# -------------------------------------------------------------- challenges --
-def ensure_daily_challenges(date_str: str, challenges: list):
-    """challenges: list of dicts with difficulty/title/description/xp_reward.
-    Idempotent — only inserts if that date+difficulty combo doesn't exist yet."""
+def get_story_progress():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM story_progress").fetchall()
+        return {r["story_id"]: dict(r) for r in rows}
+
+
+# ------------------------------------------------------------- daily login --
+def get_login_record(date_str):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM daily_login WHERE date = ?", (date_str,)).fetchone()
+        return dict(row) if row else None
+
+
+def claim_daily_login(date_str, reward: dict):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO daily_login (date, reward_json, claimed_at) VALUES (?, ?, ?)",
+            (date_str, json.dumps(reward), dt.datetime.now().isoformat()),
+        )
+
+
+def consecutive_login_days():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT date FROM daily_login ORDER BY date DESC").fetchall()
+    if not rows:
+        return 0
+    dates = [dt.date.fromisoformat(r["date"]) for r in rows]
+    count = 1
+    for i in range(1, len(dates)):
+        if (dates[i - 1] - dates[i]).days == 1:
+            count += 1
+        else:
+            break
+    return count
+
+
+def total_login_days():
+    with get_conn() as conn:
+        return conn.execute("SELECT COUNT(*) c FROM daily_login").fetchone()["c"]
+
+
+# --------------------------------------------------------- weekly challenges --
+def ensure_weekly_challenges(week_start_str, challenges: list):
     with get_conn() as conn:
         for c in challenges:
             conn.execute(
-                """INSERT OR IGNORE INTO daily_challenges
-                   (date, difficulty, title, description, xp_reward, completed)
-                   VALUES (?, ?, ?, ?, ?, 0)""",
-                (date_str, c["difficulty"], c["title"], c["description"], c["xp_reward"]),
+                "INSERT OR IGNORE INTO weekly_challenges (week_start, challenge_key, progress, target) "
+                "VALUES (?, ?, 0, ?)",
+                (week_start_str, c["key"], c["target"]),
             )
 
 
-def get_challenges_for_date(date_str: str):
+def get_weekly_challenges(week_start_str):
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM daily_challenges WHERE date = ? ORDER BY "
-            "CASE difficulty WHEN 'Easy' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END",
-            (date_str,),
+            "SELECT * FROM weekly_challenges WHERE week_start = ?", (week_start_str,)
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def complete_challenge(challenge_id: int):
+def bump_weekly_progress(week_start_str, challenge_key, amount):
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM daily_challenges WHERE id = ?", (challenge_id,)).fetchone()
-        if not row or row["completed"]:
-            return None
+        row = conn.execute(
+            "SELECT * FROM weekly_challenges WHERE week_start=? AND challenge_key=?",
+            (week_start_str, challenge_key),
+        ).fetchone()
+        if not row:
+            return
+        new_progress = row["progress"] + amount
+        completed = 1 if new_progress >= row["target"] else row["completed"]
         conn.execute(
-            "UPDATE daily_challenges SET completed = 1, completed_at = ? WHERE id = ?",
-            (dt.datetime.now().isoformat(), challenge_id),
+            "UPDATE weekly_challenges SET progress=?, completed=? WHERE week_start=? AND challenge_key=?",
+            (new_progress, completed, week_start_str, challenge_key),
         )
-        xp_reward = row["xp_reward"]
-    _award_xp_raw(xp_reward)
-    return xp_reward
 
 
-def recent_challenge_titles(days: int = 14):
-    cutoff = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+def claim_weekly_reward(week_start_str, challenge_key):
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT title FROM daily_challenges WHERE date >= ?", (cutoff,)
-        ).fetchall()
-        return {r["title"] for r in rows}
+        conn.execute(
+            "UPDATE weekly_challenges SET reward_claimed=1 WHERE week_start=? AND challenge_key=?",
+            (week_start_str, challenge_key),
+        )
 
 
-def challenge_completion_stats():
+# -------------------------------------------------------------- shop/keys --
+def get_shop_for_date(date_str):
     with get_conn() as conn:
-        total = conn.execute("SELECT COUNT(*) c FROM daily_challenges").fetchone()["c"]
-        done = conn.execute("SELECT COUNT(*) c FROM daily_challenges WHERE completed = 1").fetchone()["c"]
-    return {"total": total, "completed": done}
+        row = conn.execute("SELECT items_json FROM shop_daily WHERE date = ?", (date_str,)).fetchone()
+        return json.loads(row["items_json"]) if row else None
 
 
-def _award_xp_raw(amount: float):
+def save_shop_for_date(date_str, items: list):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO shop_daily (date, items_json) VALUES (?, ?)",
+            (date_str, json.dumps(items)),
+        )
+
+
+def add_keys(key_type: str, amount: int):
+    field = f"{key_type}_keys"
     profile = get_profile()
-    xp = float(profile.get("xp", "0") or 0)
-    set_profile("xp", xp + amount)
+    current = int(float(profile.get(field, "0") or 0))
+    set_profile(field, current + amount)
 
 
-# --------------------------------------------------------------- favorites --
-def add_favorite(item_type, title, url, notes=""):
+def spend_key(key_type: str) -> bool:
+    field = f"{key_type}_keys"
+    profile = get_profile()
+    current = int(float(profile.get(field, "0") or 0))
+    if current < 1:
+        return False
+    set_profile(field, current - 1)
+    return True
+
+
+def record_chest_opening(chest_type, item_won, rarity_won):
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO favorites (item_type, title, url, notes, added_at) VALUES (?, ?, ?, ?, ?)",
-            (item_type, title, url, notes, dt.datetime.now().isoformat()),
+            "INSERT INTO chest_openings (chest_type, item_won, rarity_won, opened_at) VALUES (?, ?, ?, ?)",
+            (chest_type, item_won, rarity_won, dt.datetime.now().isoformat()),
         )
 
 
-def get_favorites():
+def get_chest_history():
     import pandas as pd
     with get_conn() as conn:
-        return pd.read_sql_query("SELECT * FROM favorites ORDER BY added_at DESC", conn)
+        return pd.read_sql_query("SELECT * FROM chest_openings ORDER BY opened_at DESC", conn)
 
 
-def delete_favorite(fav_id: int):
-    with get_conn() as conn:
-        conn.execute("DELETE FROM favorites WHERE id = ?", (fav_id,))
+# ---------------------------------------------------------------- streak --
+def process_login_streak(today: dt.date = None):
+    """Call once per session load. Updates streak based on calendar days since last login."""
+    today = today or dt.date.today()
+    profile = get_profile()
+    last = profile.get("last_login_date", "")
 
+    if last == today.isoformat():
+        return int(profile.get("current_streak", "0") or 0), False  # already processed today
 
-# ---------------------------------------------------------- resource history --
-def mark_resource_shown(resource_id: str):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO resource_history (resource_id, shown_at, completed) VALUES (?, ?, 0)",
-            (resource_id, dt.datetime.now().isoformat()),
-        )
-
-
-def mark_resource_completed(resource_id: str):
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT id FROM resource_history WHERE resource_id = ? AND completed = 0 "
-            "ORDER BY shown_at DESC LIMIT 1", (resource_id,),
-        ).fetchone()
-        if row:
-            conn.execute(
-                "UPDATE resource_history SET completed = 1, completed_at = ? WHERE id = ?",
-                (dt.datetime.now().isoformat(), row["id"]),
-            )
+    if last == "":
+        new_streak = 1
+    else:
+        last_date = dt.date.fromisoformat(last)
+        delta = (today - last_date).days
+        if delta == 1:
+            new_streak = int(profile.get("current_streak", "0") or 0) + 1
+        elif delta > 1:
+            tokens = int(profile.get("streak_freeze_tokens", "0") or 0)
+            missed = delta - 1
+            if tokens >= missed:
+                set_profile("streak_freeze_tokens", tokens - missed)
+                new_streak = int(profile.get("current_streak", "0") or 0) + 1
+            else:
+                new_streak = 1
         else:
-            conn.execute(
-                "INSERT INTO resource_history (resource_id, shown_at, completed, completed_at) "
-                "VALUES (?, ?, 1, ?)",
-                (resource_id, dt.datetime.now().isoformat(), dt.datetime.now().isoformat()),
-            )
+            new_streak = int(profile.get("current_streak", "0") or 0)
+
+    set_profile("last_login_date", today.isoformat())
+    set_profile("current_streak", new_streak)
+    longest = int(profile.get("longest_streak", "0") or 0)
+    if new_streak > longest:
+        set_profile("longest_streak", new_streak)
+    if new_streak > 0 and new_streak % 7 == 0:
+        tokens = int(get_profile().get("streak_freeze_tokens", "0") or 0)
+        set_profile("streak_freeze_tokens", tokens + 1)
+
+    return new_streak, True
 
 
-def recently_shown_resource_ids(days: int = 21):
-    cutoff = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+# ----------------------------------------------------------- AI conversations --
+def add_conversation_message(scenario, role, content):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO ai_conversations (scenario, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (scenario, role, content, dt.datetime.now().isoformat()),
+        )
+
+
+def get_conversation(scenario):
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT DISTINCT resource_id FROM resource_history WHERE shown_at >= ?", (cutoff,)
+            "SELECT role, content FROM ai_conversations WHERE scenario = ? ORDER BY id", (scenario,)
         ).fetchall()
-        return {r["resource_id"] for r in rows}
+        return [dict(r) for r in rows]
 
 
-def completed_resource_ids():
+def clear_conversation(scenario):
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT resource_id FROM resource_history WHERE completed = 1"
-        ).fetchall()
-        return {r["resource_id"] for r in rows}
+        conn.execute("DELETE FROM ai_conversations WHERE scenario = ?", (scenario,))
 
 
-# -------------------------------------------------------------- study notes --
-def add_note(date_str, content):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO study_notes (date, content, created_at) VALUES (?, ?, ?)",
-            (date_str, content, dt.datetime.now().isoformat()),
-        )
-
-
-def get_notes():
-    import pandas as pd
-    with get_conn() as conn:
-        return pd.read_sql_query("SELECT * FROM study_notes ORDER BY date DESC", conn)
-
-
-# --------------------------------------------------------- weekly reflection --
-def save_weekly_reflection(week_start_str, report_dict):
-    import json
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO weekly_reflections (week_start, report_json, created_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(week_start) DO UPDATE SET report_json=excluded.report_json",
-            (week_start_str, json.dumps(report_dict), dt.datetime.now().isoformat()),
-        )
-
-
-def get_weekly_reflection(week_start_str):
-    import json
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT report_json FROM weekly_reflections WHERE week_start = ?", (week_start_str,)
-        ).fetchone()
-    return json.loads(row["report_json"]) if row else None
-
-
-def get_all_weekly_reflections():
-    import json
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT week_start, report_json FROM weekly_reflections ORDER BY week_start DESC"
-        ).fetchall()
-    return [(r["week_start"], json.loads(r["report_json"])) for r in rows]
-
-
-# ------------------------------------------------------------- study plan --
-DEFAULT_PLAN = {
-    "Monday": ("Listening + Reading", 30),
-    "Tuesday": ("Grammar", 30),
-    "Wednesday": ("YouTube / Video", 30),
-    "Thursday": ("Podcast", 30),
-    "Friday": ("News Article", 30),
-    "Saturday": ("Conversation Practice", 30),
-    "Sunday": ("Review / Flashcards", 30),
-}
-
-
-def ensure_study_plan():
-    with get_conn() as conn:
-        cur = conn.execute("SELECT COUNT(*) c FROM study_plan").fetchone()
-        if cur["c"] == 0:
-            for day, (activity, minutes) in DEFAULT_PLAN.items():
-                conn.execute(
-                    "INSERT INTO study_plan (day_of_week, activity, minutes) VALUES (?, ?, ?)",
-                    (day, activity, minutes),
-                )
-
-
-def get_study_plan():
-    with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM study_plan").fetchall()
-    order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-    plan = {r["day_of_week"]: dict(r) for r in rows}
-    return [plan[d] for d in order if d in plan]
-
-
-def set_study_plan_day(day_of_week, activity, minutes):
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE study_plan SET activity = ?, minutes = ? WHERE day_of_week = ?",
-            (activity, minutes, day_of_week),
-        )
-
-
-# ---------------------------------------------------------------- timeline --
-def record_timeline_event(event_key, title, description, icon, occurred_at=None):
-    """Idempotent — a given event_key is only ever recorded once."""
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO timeline_events (event_key, title, description, icon, occurred_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (event_key, title, description, icon, occurred_at or dt.datetime.now().isoformat()),
-        )
-
-
-def get_timeline():
-    import pandas as pd
-    with get_conn() as conn:
-        return pd.read_sql_query(
-            "SELECT * FROM timeline_events ORDER BY occurred_at ASC", conn
-        )
-
-
-# ---------------------------------------------------------- export / import --
+# ---------------------------------------------------------------- export --
 def export_all_data() -> dict:
-    """Full JSON-serializable snapshot of all user data for backup/migration."""
-    import json
     with get_conn() as conn:
         def rows(table):
             return [dict(r) for r in conn.execute(f"SELECT * FROM {table}").fetchall()]
-
         return {
             "exported_at": dt.datetime.now().isoformat(),
             "profile": get_profile(),
-            "sessions": rows("sessions"),
-            "saved_words": rows("saved_words"),
+            "inventory": rows("inventory"),
             "achievements_unlocked": rows("achievements_unlocked"),
-            "daily_challenges": rows("daily_challenges"),
-            "favorites": rows("favorites"),
-            "resource_history": rows("resource_history"),
-            "study_notes": rows("study_notes"),
-            "weekly_reflections": rows("weekly_reflections"),
-            "study_plan": rows("study_plan"),
-            "timeline_events": rows("timeline_events"),
+            "vocabulary": rows("vocabulary"),
+            "quiz_results": rows("quiz_results"),
+            "story_progress": rows("story_progress"),
+            "daily_login": rows("daily_login"),
+            "weekly_challenges": rows("weekly_challenges"),
+            "xp_log": rows("xp_log"),
+            "chest_openings": rows("chest_openings"),
         }
-
-
-def import_all_data(data: dict, mode: str = "merge"):
-    """Restore data previously produced by export_all_data().
-    mode='merge' keeps existing rows and adds missing ones (skip on conflict);
-    mode='replace' wipes current data first."""
-    tables = [
-        "sessions", "saved_words", "achievements_unlocked", "daily_challenges",
-        "favorites", "resource_history", "study_notes", "weekly_reflections",
-        "study_plan", "timeline_events",
-    ]
-    with get_conn() as conn:
-        if mode == "replace":
-            for t in tables:
-                conn.execute(f"DELETE FROM {t}")
-
-        for key, value in data.get("profile", {}).items():
-            conn.execute(
-                "INSERT INTO profile (key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, str(value)),
-            )
-
-        for table in tables:
-            for row in data.get(table, []):
-                row = dict(row)
-                row.pop("id", None)  # let autoincrement assign fresh ids on merge
-                cols = ", ".join(row.keys())
-                placeholders = ", ".join(["?"] * len(row))
-                try:
-                    conn.execute(
-                        f"INSERT OR IGNORE INTO {table} ({cols}) VALUES ({placeholders})",
-                        tuple(row.values()),
-                    )
-                except sqlite3.IntegrityError:
-                    continue
