@@ -19,6 +19,16 @@ general engineering approach (SQLite persistence, tested interaction flows).
   (0/250/600/1100) and a progressively steeper curve beyond that. Content unlocks exactly
   as mapped in the brief (Greetings/Numbers/Colors/Basic Vocab at 1 → Master Challenges at 50).
   The sidebar and Home page show "Only X XP until [feature] unlocks!" live.
+- **Log Immersion**: a dedicated page to log real-world German time (reading, listening,
+  watching, speaking, whatever) — converts to XP and coins (60 XP + 15 coins per hour,
+  constants live in `db.py`), shows total/weekly/monthly hours and your current streak, and
+  keeps a full history table. This feeds the same XP/coins/weekly-challenge systems as every
+  other activity in the app.
+- **Wallet**: a dedicated page showing your coin balance, key counts, a recent-purchases
+  table (pulled from real inventory acquisition records, not a fabricated log), and a
+  capped mini-activity (a quick der/die/das "Word Flip" round, +5 coins per correct answer,
+  limited to 5 rounds/day) for a little extra spending money without turning into a way to
+  farm the coin economy.
 - **Currency system**: coins, separate from XP, earned from quizzes/stories/challenges,
   spendable only on cosmetics (themes, avatar parts, pets, decorations, XP effects, titles)
   — never on anything that affects learning power.
@@ -32,9 +42,12 @@ general engineering approach (SQLite persistence, tested interaction flows).
   keeping the other three numbers exactly as given. All four tables were verified
   statistically against 200,000 simulated rolls each and matched their target percentages.
 - **Shop**: full catalog (66 items — themes, pets, avatar parts, titles, decorations, XP
-  effects) across all four rarity tiers, priced by rarity, plus a **Daily Shop** (10
-  discounted items, deterministic per-day rotation, with a genuine 2% chance of a bonus
-  legendary item appearing) and a Keys tab.
+  effects) across all four rarity tiers, priced by rarity. **The Full Catalog tab now only
+  sells Common and Uncommon items** — Rare and Legendary items are exclusive to Loot Chests
+  and the Daily Shop's rotation (which draws from the full pool, including rares, plus its
+  own 2% legendary chance), so top-tier cosmetics stay meaningfully special rather than a
+  guaranteed same-day purchase. Plus a **Daily Shop** (10 discounted items, deterministic
+  per-day rotation) and a Keys tab.
 - **Vocabulary Quiz, Article Trainer, Verb Trainer, Grammar Explorer**: all generate real
   questions from real content and grade them correctly. The verb conjugation logic was
   bug-tested directly — including catching and fixing a real error where t-stem verbs
