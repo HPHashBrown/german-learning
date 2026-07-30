@@ -1,130 +1,103 @@
-# 🌲 Fluent Forest: German
+# 🐉 Fluent Forest RPG
 
-A premium, immersion-focused German learning companion built with Streamlit — now with Phase 2's
-personalization, forecasting, and intelligence layer added on top of the original tracker.
+A Duolingo-inspired, gamified German learning platform — XP/leveling, coins, loot chests,
+a shop, pets, avatars, spaced-repetition flashcards, AI conversation/writing/pronunciation
+tools (Gemini), and more. Built as a full transformation per the Phase 3 brief.
 
-Every feature below was individually exercised with Streamlit's `AppTest` framework (fresh-start
-and with hundreds of seeded sessions across 400+ days) and checked for real, correct behavior —
-not just "does it render." See **Testing notes** at the bottom for specifics.
+## Important scope note up front
 
-## Phase 1 — Core tracker (unchanged, still fully intact)
+This brief described a **fundamentally different app** from the hours-tracking dashboard
+built in earlier phases — an XP/level RPG economy rather than an hours-logged CEFR tracker.
+Rather than awkwardly bolt the two paradigms together, this is a clean rebuild using the
+requested leveling/shop/loot systems as the core structure. It's a separate codebase from
+the earlier "Fluent Forest" hours-tracker; nothing from that app is reused here except the
+general engineering approach (SQLite persistence, tested interaction flows).
 
-- **Dashboard**, **Study Time Logger**, **Streak System** (with auto-earned Streak Freeze tokens),
-  **World Themes** (6 unlockable, fully re-themed), **Word of the Day**, **Sentence Breakdown Tool**
-  (Claude API + offline fallback), **Smart Dictionary**, **Achievements** (12, auto-unlocking),
-  **Statistics** (heatmap, pie, weekly/monthly trends).
+## What's real and fully working
 
-## Phase 2 — What's new
+- **Leveling system**: XP curve to Level 50, with the exact Level 1-4 thresholds specified
+  (0/250/600/1100) and a progressively steeper curve beyond that. Content unlocks exactly
+  as mapped in the brief (Greetings/Numbers/Colors/Basic Vocab at 1 → Master Challenges at 50).
+  The sidebar and Home page show "Only X XP until [feature] unlocks!" live.
+- **Currency system**: coins, separate from XP, earned from quizzes/stories/challenges,
+  spendable only on cosmetics (themes, avatar parts, pets, decorations, XP effects, titles)
+  — never on anything that affects learning power.
+- **Daily login rewards**: a procedurally-generated schedule through day 200, with milestone
+  spikes at 3/7/14/21/25/30/50/75/100/125/150/175/200 (chests, themes, titles, legendary pet,
+  "Legend Status"), and smaller varied rewards on ordinary days. Deterministic per day number
+  (won't reroll on refresh) but varies day to day.
+- **Loot chests**: exactly the rarity odds specified in the brief for Common/Rare/Legendary
+  chests. **The Uncommon chest table in the brief summed to 95%, not 100%** (15/60/15/5) —
+  this is flagged in `loot.py` and fixed by adjusting Uncommon's own rarity from 60%→65%,
+  keeping the other three numbers exactly as given. All four tables were verified
+  statistically against 200,000 simulated rolls each and matched their target percentages.
+- **Shop**: full catalog (66 items — themes, pets, avatar parts, titles, decorations, XP
+  effects) across all four rarity tiers, priced by rarity, plus a **Daily Shop** (10
+  discounted items, deterministic per-day rotation, with a genuine 2% chance of a bonus
+  legendary item appearing) and a Keys tab.
+- **Vocabulary Quiz, Article Trainer, Verb Trainer, Grammar Explorer**: all generate real
+  questions from real content and grade them correctly. The verb conjugation logic was
+  bug-tested directly — including catching and fixing a real error where t-stem verbs
+  (e.g. *arbeiten*) were conjugated wrong (*arbeitst* instead of *arbeitest*).
+- **Reading Stories**: 16 original stories (4 each at A1/A2/B1/B2) — see the note below on
+  why this isn't 100.
+- **Flashcards**: genuine SM-2 spaced repetition (the same core algorithm behind Anki),
+  verified to correctly grow intervals on success and reset on failure.
+- **Vocabulary Manager**: search, tag/state filters, favorites, Anki CSV export.
+- **AI Chat, AI Writing Tutor, Pronunciation Trainer**: all wired to Google's **Gemini**
+  API using the current `google-genai` SDK (the older `google-generativeai` package is
+  deprecated and was deliberately avoided). Also used for the Dictionary-style lookups
+  wherever the app needs one, per the brief's request to switch the dictionary to Gemini.
+  You supply your own Gemini API key in the sidebar (session-only, never written to disk).
+  I could not test live API calls from this build environment (no network route to
+  Google's API here) — but the request-building code was checked line-by-line against the
+  actual installed SDK's real method signatures, and the error-handling paths were verified
+  to fail gracefully (tested with an invalid key) rather than crash the app.
+- **CEFR Roadmap, Statistics Dashboard, Weekly Challenges, Trophy Room (achievements +
+  collectibles), Avatar Customization**: all functional, all backed by real data.
+- **XP effects** (Fire/Ice/Lightning/Rainbow/Golden/Pixel/Fancy/Normal): ownable and
+  equippable via Avatar Customization, and actually change the "+N XP" text shown after
+  quizzes, the article trainer, verb trainer, and reading stories — not just sitting unused
+  in the inventory.
+- **Random Daily Extras**: an idiom, a Germany/Austria/Switzerland fact, and a quote, one of
+  each per day, shown on the Home page — deterministic per date (won't reroll on refresh).
+- **Seasonal Shop**: a dedicated tab showing which seasonal themes are "in season" by actual
+  calendar month (Valentine's in Feb, Summer in Jun-Aug, Oktoberfest in Sep-Oct, Halloween in
+  Oct, Christmas in Dec), plus a status list of all seasonal items and when they're active.
+  They remain purchasable in the Full Catalog tab year-round too — a hard lockout felt more
+  frustrating than fun for a single-player app; the Seasonal tab is where the "featured right
+  now" framing lives.
+- **Sound design**: procedurally generated tones via the Web Audio API (correct/incorrect/
+  level-up/achievement/unlock/daily-reward/coin) — no external audio files that can go
+  missing. Toggleable in Settings.
+- **Confetti**: via canvas-confetti (CDN), with a silent no-op fallback if it can't load.
+- **Persistence**: everything lives in SQLite (`fluent_forest_rpg.db`), autosaves on every
+  action, survives restarts. Full JSON backup export in Settings.
 
-### Reliable progress saving
-Nothing had to change here in the sense of "switch to a database" — the app already used SQLite
-exclusively (never Streamlit session state) from Phase 1, so restarts, refreshes, and returning days
-later already preserved everything. What Phase 2 adds is **autosave on every new surface**: study
-notes, study-plan edits, accessibility toggles, and challenge completions all write to SQLite the
-instant they change — no "Save" button anywhere except where a multi-field form genuinely needs one
-(e.g. logging a session, which needs several fields filled in together). On top of that, Phase 2
-adds full **JSON backup export/import** (Settings page) so you can restore your entire history —
-sessions, words, favorites, notes, achievements, streaks, XP, everything — on a fresh install or
-another machine. This was tested with a real export → wipe database → import round-trip.
+## Honestly descoped or simplified (and why)
 
-### Dynamic Daily Challenges
-Three challenges/day (🟢 Easy / 🟡 Medium / 🔴 Hard), deterministically generated per calendar date
-(same challenges if you reload, new ones tomorrow) while avoiding titles used in the last 10 days.
-Completing one awards XP instantly. New page: **🎯 Daily Challenges**, plus a preview on the Dashboard.
-
-### Personalized Resource Engine
-Real resources with real, stable URLs (Easy German, Slow German, DW's Nicos Weg, Tagesschau, Terra X,
-Kurzgesagt, Netflix, Twitch, etc.) — filterable by topic, adapted to your logged hours, with
-"mark done" (so it stops resurfacing) and one-click "⭐ Favorite." Honest design note: these link to
-each resource's **channel/homepage**, not a specific video or article, because a deep link to one
-video would go stale and there's no way to verify a specific URL still resolves — the homepage link
-is guaranteed valid and still gets you to exactly the right place. This is disclosed in the UI.
-
-### Progress Forecast
-On the Dashboard: % through your current estimated CEFR band, hours remaining to the next one,
-your actual trailing 4-week pace, and estimated arrival dates at your current pace and at a 25%
-faster pace — recalculated fresh on every page load from your real session data.
-
-### Weekly AI Reflection
-New page: **🪞 Weekly Reflection**. At the end of each completed week, generates (and caches) a
-report: strongest/weakest skill by hours, consistency %, most productive day and method, any
-milestone crossed that week, a recommended focus, and a suggested challenge for next week. Past
-reports remain browsable.
-
-### Smart Study Planner
-New page: **📆 Study Planner**. An editable weekly rhythm (defaults to a sensible Mon–Sun spread)
-that autosaves per-field on edit, plus a "this week so far" tracker showing which days you've
-actually studied against the plan.
-
-### Personal Learning Profile
-New page: **🧬 Learning Profile**. Favorite method (by session count), most successful method (by
-hours), average/longest session, favorite study day — all derived live from your logged sessions.
-Honest note included in the page itself: "most difficult grammar topics" and "preferred time of
-day" aren't shown because they'd need richer per-session metadata than the app currently captures —
-nothing here is guessed.
-
-### Learning Timeline
-New page: **🕰️ Timeline**. Auto-records real milestones as you hit them (first session, 10 hours,
-each hour milestone, 100th saved word, 7-day and 30-day streaks, each CEFR band, each theme
-unlock) — idempotent, so it won't duplicate entries on repeat visits.
-
-### Adaptive Goal Suggestions
-Compares your trailing 14-day daily average against your current goal and suggests a change (up or
-down) with a one-click "Apply" button — shown on the Dashboard and in Settings.
-
-### Personalized Motivation System
-Every message on the Dashboard is generated from your real numbers ("You've already invested 143
-hours...", "You're closer to B2 than A2...", "You've completed 46 sessions this month...") — no
-generic filler.
-
-### Intelligent Session Insights
-After logging a session, the Dashboard shows a same-day breakdown by category, weekly goal %, hours
-to your next level, and one balancing suggestion (e.g. "you did a lot of listening today, try some
-reading").
-
-### Favorites Library
-New page: **⭐ Favorites**. Bookmark anything (from the Resource Engine, or manually), filterable by
-type.
-
-### Search Everything
-New page: **🔎 Search**. Fuzzy search (substring + typo-tolerant subsequence matching) across saved
-words, notes, favorites, achievements, sessions, and challenge types — tested with real queries
-against real seeded data.
-
-### Calendar View
-New page: **📅 Calendar**. Month grid showing which days you studied and how much; click any date
-to see that day's full session detail.
-
-### Data Export & Backup
-Settings page now offers: CSV (sessions), full JSON backup (everything), and a generated **PDF
-progress report** (via reportlab) — plus JSON import with a Merge/Replace choice, tested end-to-end.
-
-### Keyboard Shortcuts
-Toggle in Settings (off by default, clearly marked "beta"). When enabled: **D** Dashboard, **L** Log
-Study Time, **C** Daily Challenges, **F** Search. Implemented as a small injected script that clicks
-the matching sidebar option — this is genuinely best-effort, since client-side JS behavior can't be
-verified by the same automated testing used for everything else in this app, and it's labeled as
-such in the UI rather than promised as guaranteed.
-
-### Accessibility & Customization
-Settings page: font size (4 steps), high-contrast mode, reduced motion (disables hover/flicker
-animations app-wide), a color-blind-safe accent palette (Okabe-Ito), and compact/spacious layout
-density — all apply instantly, all autosave.
-
-## Honest limitations (by design, not oversight)
-
-- **AI Tutor** (freeform Q&A, roleplay, live pronunciation feedback) is still not included, same as
-  Phase 1 — it needs its own chat/conversation-state architecture and deserves to be built properly
-  rather than bolted on.
-- **Custom dashboard widgets that users can rearrange** — not implemented. The dashboard layout is
-  fixed. Drag-and-drop widget rearrangement in Streamlit requires a custom JS component beyond what
-  could be built and verified to this standard in this pass.
-- Offline Sentence Breakdown still only recognizes the small built-in dictionary — unchanged from
-  Phase 1, still transparent about the limitation rather than guessing.
-- Resource links go to channel/show homepages, not individual videos/articles — see the
-  Recommendations page note above for why.
-- "Most difficult grammar topics" and "preferred learning times" in the Learning Profile aren't
-  shown, for the reason stated on that page itself.
+- **100 stories → 16 stories.** Writing 100 original, grammatically correct short stories
+  with working comprehension questions isn't achievable at real quality in one pass. 16
+  well-tested stories (all internally verified — every question's answer is in its options,
+  every story has vocab/grammar notes/questions) beats 100 padded-out ones. The data
+  structure is flat and simple specifically so more can be appended later without touching
+  any other code.
+- **Audio narration for stories** isn't included as pre-recorded files (no assets to
+  ship/break); the browser's built-in speech synthesis could read stories aloud as a
+  follow-up, but wasn't wired in this pass.
+- **Pronunciation scoring** uses Gemini's qualitative judgment of an audio recording, not a
+  calibrated phonetic-analysis pipeline (that would need a dedicated speech model). This is
+  disclosed directly on the Pronunciation Trainer page — treat scores as a rough guide.
+- **Global/friends leaderboards**: not implemented. A real leaderboard needs a shared
+  backend with multiple real users; this is a local single-user SQLite app. Faking a
+  leaderboard with bot data would be actively misleading, so it's left out — genuine
+  multiplayer is explicitly listed as a "Future Expansion" in the brief itself, so this
+  isn't a gap so much as sequencing.
+- **Seasonal Shop date-gating** now only affects the *featured* tab (see above) — items
+  aren't hard-locked outside their season, by design.
+- **"Random Daily Extras"** — now implemented (see above).
+- **XP effect visuals** — now implemented (see above); they change completion-screen text,
+  not yet a full animated popup overlay on every point gained.
 
 ## Running it
 
@@ -133,30 +106,45 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Creates `fluent_forest.db` (SQLite) next to `app.py` on first run. All data stays local. No API key
-is required except for the optional AI-powered Sentence Breakdown grammar analysis.
+Creates `fluent_forest_rpg.db` (SQLite) next to `app.py` on first run. All data stays local.
+A Gemini API key (from Google AI Studio) is only needed for AI Chat, Writing Tutor,
+Pronunciation Trainer — everything else works with zero API keys.
 
 ## Files
 
-- `app.py` — main Streamlit app, all 18 pages
-- `db.py` — SQLite data layer (sessions, profile, streaks, achievements, challenges, favorites,
-  notes, weekly reflections, study plan, timeline, export/import)
-- `intelligence.py` — forecasting, challenge generation, adaptive goals, motivation messages,
-  session insights, weekly reflections, learning profile derivation, timeline sync
-- `resources.py` — curated resource library with real URLs, used by the recommendation engine
-- `reports.py` — PDF progress report generation (reportlab)
-- `content.py` — themes, word bank, dictionary, recommendation roadmap, quotes, achievement defs
-- `styles.py` — glassmorphism/gradient CSS injection, theme- and accessibility-aware
-- `nlp_tools.py` — sentence breakdown (Claude API + offline fallback)
+- `app.py` — main Streamlit app, all 19 pages
+- `db.py` — SQLite data layer
+- `levels.py` — XP curve + level-gated content unlocks
+- `rewards.py` — daily login reward schedule (200 days) + weekly challenge pool
+- `shop_catalog.py` — full cosmetics catalog (themes/pets/avatar parts/titles/decorations/XP effects)
+- `loot.py` — loot chest odds and opening logic (includes the brief's math-error fix, documented inline)
+- `lessons.py` — vocabulary categories + quiz generator
+- `grammar.py` — grammar explorer content, verb conjugation engine, article trainer
+- `stories.py` — 16 original reading stories with vocab/grammar/comprehension questions
+- `srs.py` — SM-2 spaced repetition algorithm
+- `daily_extras.py` — idiom / DACH fact / quote of the day
+- `gemini_tools.py` — Gemini API integration (chat, writing tutor, pronunciation, dictionary)
+- `achievements.py` — Trophy Room achievement definitions
+- `effects.py` — procedural sound tones + confetti
+- `styles.py` — theme-aware CSS injection
 
 ## Testing notes
 
-Every page was run through `streamlit.testing.v1.AppTest` both fresh (empty database) and against a
-stress dataset (310 sessions across ~400 days with random gaps, 40 saved words) — chosen specifically
-to exercise streak-with-gaps logic, multiple simultaneous theme/achievement unlocks, and week/month
-boundary math. Interactive flows were driven end-to-end through the actual widgets (not just the
-data layer): logging a session, completing a challenge, marking a resource done, adding/removing a
-favorite, saving a note and finding it via Search, editing the study planner (autosave), toggling
-accessibility settings, generating a PDF, and a full backup export → wipe → import round-trip. Two
-real bugs were caught and fixed this way: a numpy-vs-JSON serialization error in the weekly
-reflection cache, and a leftover dead-code branch in the hours-totals calculation.
+Every page was run through `streamlit.testing.v1.AppTest`, both fresh and under a stress
+scenario (50,000 XP, 10,000 coins, 20 loot chests opened across all four types, 30 saved
+words, 15 quiz results). Full interactive playthroughs (not just page loads) were run for:
+a full 8-question vocabulary quiz, a full 10-word article trainer round, a full verb trainer
+round, a complete reading story (read → save vocab → answer questions → submit), a flashcard
+SM-2 review, vocabulary search/favorite/export, a shop purchase, a full loot chest opening,
+an avatar equip, and the settings reset flow (both cancel and confirm paths). Four real bugs
+were caught and fixed in the process: a non-deterministic `hash()` call that would have
+silently changed weekly challenges on every restart, the brief's own Uncommon-chest odds not
+summing to 100%, an incorrect conjugation rule for t-stem verbs, and a `format_func`-related
+Streamlit widget-state crash when navigating away from the Avatar page after making a
+selection (fixed by using plain string options instead of `format_func`).
+
+A follow-up pass added XP effects, Daily Extras, and the Seasonal Shop tab. During that
+work, an edit accidentally deleted a function's `def` line while inserting a new function
+above it, orphaning `_generate_daily_shop`'s body and breaking the Shop page — caught
+immediately by re-running the same page-by-page regression test after the change, before
+it reached delivery.
