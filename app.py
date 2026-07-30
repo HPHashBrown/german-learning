@@ -195,10 +195,10 @@ inject_css(profile.get("equipped_theme", "light"), reduced_motion=False)
 daily_result = process_daily_login()
 
 NAV_PAGES = [
-    "🏠 Home", "📚 Vocabulary Quiz", "🔤 Article Trainer", "🔀 Verb Trainer",
+    "🏠 Home", "🌲 Log Immersion", "📚 Vocabulary Quiz", "🔤 Article Trainer", "🔀 Verb Trainer",
     "📝 Grammar Explorer", "📖 Reading Stories", "🃏 Flashcards", "📇 Vocabulary Manager",
     "💬 AI Chat", "✍️ AI Writing Tutor", "🎤 Pronunciation Trainer",
-    "🗺️ CEFR Roadmap", "📊 Statistics", "🎯 Weekly Challenges",
+    "🗺️ CEFR Roadmap", "📊 Statistics", "🎯 Weekly Challenges", "💰 Wallet",
     "🛍️ Shop", "📦 Loot Chests", "🧑‍🎨 Avatar", "🏆 Trophy Room", "⚙️ Settings",
 ]
 
@@ -339,6 +339,61 @@ if page == "🏠 Home":
             st.markdown(f"- **{s['title']}** ({s['level']})")
     else:
         st.caption("You've completed every unlocked story — nice work! Level up for more.")
+
+
+# ----------------------------------------------------------------------------
+# PAGE: Log Immersion
+# ----------------------------------------------------------------------------
+elif page == "🌲 Log Immersion":
+    st.markdown("## 🌲 Log German Immersion")
+    st.caption(
+        f"Log any time spent with German outside the app — reading, listening, watching, "
+        f"speaking, whatever. Converts to **{db.IMMERSION_XP_PER_HOUR} XP** and "
+        f"**{db.IMMERSION_COINS_PER_HOUR} 🪙 per hour**."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    imm_totals = db.immersion_totals()
+    with c1:
+        card_start(); st.metric("Total Hours", imm_totals["total_hours"]); card_end()
+    with c2:
+        card_start(); st.metric("This Week", imm_totals["week_hours"]); card_end()
+    with c3:
+        card_start(); st.metric("This Month", imm_totals["month_hours"]); card_end()
+    with c4:
+        card_start(); st.metric("Streak", f"{stats['current_streak']} 🔥"); card_end()
+
+    with st.form("log_immersion_form", clear_on_submit=True):
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            log_date = st.date_input("Date", value=dt.date.today(), max_value=dt.date.today())
+            hours = st.number_input("Hours", min_value=0.1, max_value=16.0, value=0.5, step=0.25)
+        with cc2:
+            category = st.selectbox("Category", [
+                "Reading", "Listening", "Watching", "Speaking", "Podcast",
+                "Movies/TV", "Conversation", "Other",
+            ])
+            notes = st.text_input("Notes (optional)", placeholder="e.g. Easy German episode 214")
+
+        submitted = st.form_submit_button("✅ Log Immersion Time", type="primary", width='stretch')
+        if submitted:
+            xp_earned, coins_earned = db.add_immersion_session(
+                log_date.isoformat(), hours, category, notes,
+            )
+            week_start = (dt.date.today() - dt.timedelta(days=dt.date.today().weekday())).isoformat()
+            db.bump_weekly_progress(week_start, "earn_xp", xp_earned)
+            st.success(f"Logged {hours}h of {category}! {xp_gain_display(xp_earned, profile)}, +{coins_earned} 🪙")
+            play_sound("coin", profile.get("sound_enabled", "1") == "1")
+            st.rerun()
+
+    st.markdown("### Recent Sessions")
+    sessions_df = db.get_immersion_sessions()
+    if sessions_df.empty:
+        st.info("No immersion time logged yet — add your first session above!")
+    else:
+        show = sessions_df[["date", "hours", "category", "notes", "xp_earned", "coins_earned"]].head(20).copy()
+        show["date"] = show["date"].dt.strftime("%Y-%m-%d")
+        st.dataframe(show, width='stretch', hide_index=True)
 
 
 # ----------------------------------------------------------------------------
@@ -1032,6 +1087,81 @@ elif page == "🎯 Weekly Challenges":
 
 
 # ----------------------------------------------------------------------------
+# PAGE: Wallet
+# ----------------------------------------------------------------------------
+elif page == "💰 Wallet":
+    st.markdown("## 💰 Wallet")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        card_start()
+        st.markdown("#### Balance")
+        st.markdown(f"# 🪙 {stats['coins']:,}")
+        card_end()
+    with c2:
+        card_start()
+        st.markdown("#### Keys")
+        key_line = "  &nbsp;&nbsp; ".join(
+            f"🔑 {kt.title()}: {profile.get(f'{kt}_keys','0')}"
+            for kt in ["common", "uncommon", "rare", "legendary"]
+        )
+        st.markdown(key_line)
+        card_end()
+
+    st.markdown("### 🧾 Recent Purchases")
+    recent = db.get_recent_purchases(15)
+    if recent.empty:
+        st.info("No purchases yet — visit the Shop or open a Loot Chest!")
+    else:
+        display = recent.copy()
+        display["item"] = display["item_id"].apply(lambda i: sc.get_item(i)["name"] if sc.get_item(i) else i)
+        display["source"] = display["acquired_via"].map({"shop": "🛍️ Shop", "chest": "📦 Chest"})
+        st.dataframe(
+            display[["item", "item_type", "rarity", "source", "acquired_at"]],
+            width='stretch', hide_index=True,
+        )
+
+    st.markdown("---")
+    st.markdown("### 🎮 Quick Coin Activity: Word Flip")
+    st.caption(
+        "A fast der/die/das round for a few extra coins — capped at 5 rounds per day so it "
+        "stays a fun bonus rather than a way to farm the economy. +5 🪙 per correct answer."
+    )
+    plays_today = db.coin_activity_plays_today()
+    remaining = max(0, 5 - plays_today)
+    st.markdown(f"**Rounds left today: {remaining}/5**")
+
+    if remaining <= 0:
+        st.info("You've used today's rounds — come back tomorrow!")
+    else:
+        if "wallet_flip_q" not in st.session_state:
+            st.session_state.wallet_flip_q = None
+
+        if st.session_state.wallet_flip_q is None:
+            if st.button("Start Round", type="primary"):
+                st.session_state.wallet_flip_q = grammar.make_article_question(random.Random())
+                st.rerun()
+        else:
+            q = st.session_state.wallet_flip_q
+            card_start()
+            st.markdown(f"### ___ {q['noun']}")
+            cols = st.columns(3)
+            for i, opt in enumerate(q["options"]):
+                with cols[i]:
+                    if st.button(opt, key=f"wallet_flip_{opt}", width='stretch'):
+                        db.register_coin_activity_play()
+                        if opt == q["correct"]:
+                            db.add_coins(5)
+                            play_sound("coin", profile.get("sound_enabled", "1") == "1")
+                            st.success(f"Richtig! +5 🪙")
+                        else:
+                            st.error(f"Nope — it's **{q['correct']} {q['noun']}**")
+                        st.session_state.wallet_flip_q = None
+                        st.rerun()
+            card_end()
+
+
+# ----------------------------------------------------------------------------
 # PAGE: Shop
 # ----------------------------------------------------------------------------
 elif page == "🛍️ Shop":
@@ -1064,9 +1194,11 @@ elif page == "🛍️ Shop":
                 card_end()
 
     with tab2:
-        type_filter = st.selectbox("Category", ["All"] + sorted({i["type"] for i in sc.PURCHASABLE_ITEMS}))
-        rarity_filter = st.selectbox("Rarity", ["All", "common", "uncommon", "rare", "legendary"])
-        items = sc.PURCHASABLE_ITEMS
+        st.caption("Rare and Legendary items aren't sold here — they're exclusive to "
+                   "Loot Chests and the Daily Shop's rotation. Keeps them special!")
+        type_filter = st.selectbox("Category", ["All"] + sorted({i["type"] for i in sc.CATALOG_TAB_ITEMS}))
+        rarity_filter = st.selectbox("Rarity", ["All", "common", "uncommon"])
+        items = sc.CATALOG_TAB_ITEMS
         if type_filter != "All":
             items = [i for i in items if i["type"] == type_filter]
         if rarity_filter != "All":
