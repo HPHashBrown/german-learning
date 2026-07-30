@@ -1,999 +1,1284 @@
 import datetime as dt
 import json
+import random
 
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 import db
-import intelligence as intel
-import resources as res
-import reports
-from content import (
-    THEMES, WORD_BANK, word_of_day, MINI_DICTIONARY, RECOMMENDATION_ROADMAP,
-    TOPIC_FILTERS, recommendations_for_hours, QUOTES, quote_of_day,
-    achievement_definitions,
-)
-from styles import inject_css, card_start, card_end, metric_html
-from nlp_tools import analyze_with_claude, analyze_offline
+import levels
+import rewards
+import shop_catalog as sc
+import loot
+import lessons
+import grammar
+import stories
+import gemini_tools as gt
+import achievements as ach
+import daily_extras
+from srs import sm2, next_due_date
+from styles import inject_css, card_start, card_end, xp_bar, rarity_span
+from effects import play_sound, confetti_burst
 
-st.set_page_config(
-    page_title="Fluent Forest: German",
-    page_icon="🌲",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Fluent Forest RPG", page_icon="🐉", layout="wide",
+                    initial_sidebar_state="expanded")
 
 db.init_db()
-db.ensure_study_plan()
+
 
 # ----------------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------------
+def grant_reward(reward: dict):
+    """Applies a reward dict (from rewards.py or loot) to the profile.
+    Returns a human-readable description of what was granted."""
+    t = reward.get("type")
+    if t == "xp":
+        db.add_xp(reward["amount"], "daily_reward")
+        return f"+{reward['amount']} XP"
+    if t == "coins":
+        db.add_coins(reward["amount"])
+        return f"+{reward['amount']} Coins"
+    if t == "chest":
+        db.add_keys(reward["chest"], 1)
+        return f"1x {reward['chest'].title()} Key (open it in Loot Chests!)"
+    if t == "theme":
+        item = sc.get_item(reward["item"])
+        if item:
+            db.grant_item(item["id"], item["type"], item["rarity"], via="daily_reward")
+            return f"New Theme: {item['name']}"
+    if t == "title":
+        db.grant_item(f"title_{reward['item'].lower().replace(' ', '_')}", "title", "rare", via="daily_reward")
+        return f"New Title: {reward['item']}"
+    if t == "pet":
+        item = sc.get_item(reward["item"])
+        if item:
+            db.grant_item(item["id"], item["type"], item["rarity"], via="daily_reward")
+            return f"New Pet: {item['name']}"
+    if t == "key":
+        db.add_keys(reward["key"], 1)
+        return f"1x {reward['key'].title()} Key"
+    if t == "xp_boost":
+        return "2x XP Boost (cosmetic reward — noted, no mechanical boost wired up yet)"
+    if t in ("legend_status", "legend_status_2"):
+        db.add_keys("legendary", 1)
+        db.unlock_achievement(t)
+        return "Legend Status unlocked + 1x Legendary Key!"
+    return reward.get("label", "Reward")
 
-def unlocked_theme_list(profile):
-    return [t.strip() for t in profile.get("unlocked_themes", "Neon Megacity").split(",") if t.strip()]
+
+def process_daily_login():
+    today_str = dt.date.today().isoformat()
+    existing = db.get_login_record(today_str)
+    if existing:
+        return None  # already claimed today
+
+    streak, changed = db.process_login_streak()
+    day_number = db.total_login_days() + 1
+    reward = rewards.reward_for_day(day_number)
+    description = grant_reward(reward)
+    db.claim_daily_login(today_str, reward)
+    return {"day_number": day_number, "reward": reward, "description": description, "streak": streak}
 
 
-def check_theme_unlocks(total_hours, profile):
-    unlocked = set(unlocked_theme_list(profile))
-    newly = []
-    for name, meta in THEMES.items():
-        if total_hours >= meta["unlock_hours"] and name not in unlocked:
-            unlocked.add(name)
-            newly.append(name)
-    if newly:
-        db.set_profile("unlocked_themes", ",".join(sorted(unlocked)))
-    return newly
+def build_stats_snapshot():
+    profile = db.get_profile()
+    xp = int(float(profile.get("xp", "0") or 0))
+    level = levels.level_for_xp(xp)
+    if str(level) != profile.get("level"):
+        db.set_profile("level", level)
+
+    quiz_df = db.get_quiz_results()
+    vocab_df = db.get_vocab_df()
+    inventory_df = db.get_inventory()
+    story_progress = db.get_story_progress()
+    chest_history = db.get_chest_history()
+
+    stats = {
+        "xp": xp, "level": level, "coins": int(float(profile.get("coins", "0") or 0)),
+        "current_streak": int(profile.get("current_streak", "0") or 0),
+        "longest_streak": int(profile.get("longest_streak", "0") or 0),
+        "quizzes_completed": len(quiz_df),
+        "perfect_quizzes": int((quiz_df["score"] == quiz_df["total"]).sum()) if not quiz_df.empty else 0,
+        "words_saved": len(vocab_df),
+        "words_mastered": int((vocab_df["srs_state"] == "Mastered").sum()) if not vocab_df.empty else 0,
+        "stories_completed": sum(1 for v in story_progress.values() if v["completed"]),
+        "stories_total": len(stories.STORIES),
+        "chests_opened": len(chest_history),
+        "legendary_items_owned": int((inventory_df["rarity"] == "legendary").sum()) if not inventory_df.empty else 0,
+        "pets_owned": int((inventory_df["item_type"] == "pet").sum()) if not inventory_df.empty else 0,
+    }
+    return stats, profile
 
 
 def check_achievements(stats):
     unlocked_keys = db.get_unlocked_achievements()
     newly = []
-    for a in achievement_definitions():
+    for a in ach.achievement_definitions():
         if a["key"] not in unlocked_keys and a["check"](stats):
             db.unlock_achievement(a["key"])
             newly.append(a)
     return newly
 
 
-def build_stats_snapshot():
-    profile = db.get_profile()
-    t = db.totals()
-    saved_words_df = db.get_saved_words()
-    return {
-        "total_hours": t["total_hours"],
-        "current_streak": int(profile.get("current_streak", "0") or 0),
-        "longest_streak": int(profile.get("longest_streak", "0") or 0),
-        "saved_words": len(saved_words_df),
-        "themes_unlocked": len(unlocked_theme_list(profile)),
-        "sessions": t["sessions"],
-    }, profile, t
+def equipped_pet_emoji(profile):
+    pet_id = profile.get("equipped_pet", "")
+    item = sc.get_item(pet_id) if pet_id else None
+    return item["emoji"] if item else None
 
 
-def cefr_estimate(total_hours: float) -> str:
-    # Rough, widely-cited FSI-style bands adapted for informal self-study hours.
-    bands = [
-        (0, 50, "Pre-A1"), (50, 150, "A1"), (150, 300, "A2"),
-        (300, 600, "B1"), (600, 1000, "B2"), (1000, 1600, "C1"),
-        (1600, 999999, "C2 (approaching)"),
-    ]
-    for lo, hi, label in bands:
-        if lo <= total_hours < hi:
-            return label
-    return "C2 (approaching)"
+def pet_react(mood: str):
+    """mood: 'happy' | 'sad' | 'excited'. Purely cosmetic flavor text."""
+    reactions = {
+        "happy": ["wags its tail! 🐾", "looks pleased!", "does a little happy hop!"],
+        "sad": ["tilts its head sadly.", "looks a little disappointed.", "sighs softly."],
+        "excited": ["can't contain its excitement! ✨", "does a happy spin!", "cheers you on!"],
+    }
+    return random.choice(reactions.get(mood, ["reacts."]))
 
 
-def hours_to_next_milestone(total_hours):
-    for m in db.MILESTONES_HOURS:
-        if total_hours < m:
-            return m, m - total_hours
-    return None, 0
+def xp_gain_display(amount: int, profile: dict) -> str:
+    """Renders an XP gain using whatever XP effect the player has equipped
+    (defaults to a plain '+N XP' if none equipped or 'xp_normal' owned)."""
+    effect_id = profile.get("equipped_xp_effect", "")
+    effect = sc.get_item(effect_id) if effect_id else None
+    if not effect or effect["type"] != "xp_effect" or effect_id == "xp_normal":
+        return f"+{amount} XP"
+    return f"{effect['emoji']} +{amount} XP {effect['emoji']}"
 
 
-CHALLENGE_TITLES_FLAT = [title for pool in intel.CHALLENGE_BANK.values() for title, _, _ in pool]
+def _generate_daily_shop(date_str: str):
+    import hashlib
+    seed = int(hashlib.md5(date_str.encode()).hexdigest(), 16) % (2**31)
+    rng = random.Random(seed)
+
+    non_legendary = [i for i in sc.PURCHASABLE_ITEMS if i["rarity"] != "legendary"]
+    picks = rng.sample(non_legendary, min(10, len(non_legendary)))
+    items = [{"id": p["id"], "discount_pct": rng.choice([20, 25, 30, 40, 50])} for p in picks]
+
+    if rng.random() < 0.02:
+        legendary_pool = [i for i in sc.PURCHASABLE_ITEMS if i["rarity"] == "legendary"]
+        if legendary_pool:
+            leg = rng.choice(legendary_pool)
+            items.append({"id": leg["id"], "discount_pct": 10, "is_legendary_special": True})
+
+    db.save_shop_for_date(date_str, items)
+    return items
+
+
+def _get_daily_shop():
+    today_str = dt.date.today().isoformat()
+    existing = db.get_shop_for_date(today_str)
+    return existing if existing else _generate_daily_shop(today_str)
+
+
+def _buy_item(item_id: str, price: int, sound_enabled: bool):
+    if db.owns_item(item_id):
+        st.info("You already own this!")
+        return
+    if db.spend_coins(price):
+        item = sc.get_item(item_id)
+        db.grant_item(item["id"], item["type"], item["rarity"], via="shop")
+        play_sound("coin", sound_enabled)
+        st.toast(f"Purchased {item['name']}!")
+        st.rerun()
+    else:
+        st.error("Not enough coins!")
 
 
 # ----------------------------------------------------------------------------
 # Sidebar
 # ----------------------------------------------------------------------------
-
 profile = db.get_profile()
-inject_css(
-    profile.get("current_theme", "Neon Megacity"),
-    font_size=profile.get("font_size", "Medium"),
-    high_contrast=profile.get("high_contrast", "0") == "1",
-    reduced_motion=profile.get("reduced_motion", "0") == "1",
-    colorblind_mode=profile.get("colorblind_mode", "0") == "1",
-    layout_density=profile.get("layout_density", "Spacious"),
-)
+inject_css(profile.get("equipped_theme", "light"), reduced_motion=False)
 
-# Auto-generate today's challenges and sync the timeline once per render.
-intel.generate_daily_challenges()
-intel.sync_timeline_events()
+daily_result = process_daily_login()
 
 NAV_PAGES = [
-    "🏠 Dashboard", "⏱️ Log Study Time", "🎯 Daily Challenges", "🌍 World Themes",
-    "📖 Word of the Day", "🔍 Sentence Breakdown", "📚 Dictionary",
-    "🧭 Recommendations", "📆 Study Planner", "🪞 Weekly Reflection",
-    "🧬 Learning Profile", "🕰️ Timeline", "⭐ Favorites", "🔎 Search",
-    "📅 Calendar", "🏆 Achievements", "📊 Statistics", "⚙️ Settings",
+    "🏠 Home", "📚 Vocabulary Quiz", "🔤 Article Trainer", "🔀 Verb Trainer",
+    "📝 Grammar Explorer", "📖 Reading Stories", "🃏 Flashcards", "📇 Vocabulary Manager",
+    "💬 AI Chat", "✍️ AI Writing Tutor", "🎤 Pronunciation Trainer",
+    "🗺️ CEFR Roadmap", "📊 Statistics", "🎯 Weekly Challenges",
+    "🛍️ Shop", "📦 Loot Chests", "🧑‍🎨 Avatar", "🏆 Trophy Room", "⚙️ Settings",
 ]
 
 with st.sidebar:
-    st.markdown("## 🌲 Fluent Forest")
-    st.caption("German, immersively.")
+    st.markdown("## 🐉 Fluent Forest RPG")
+    stats, profile = build_stats_snapshot()
+    lvl, into, span, pct, next_lvl = levels.xp_progress(stats["xp"])
 
-    display_name = st.text_input("Your name", value=profile.get("display_name", "Sprachfreund"))
-    if display_name != profile.get("display_name"):
-        db.set_profile("display_name", display_name)
+    pet_emoji = equipped_pet_emoji(profile)
+    if pet_emoji:
+        st.markdown(f'<div class="pet-companion">{pet_emoji}</div>', unsafe_allow_html=True)
+
+    st.markdown(f"**{profile.get('display_name','Sprachheld')}** — Level {lvl}")
+    xp_bar(pct, f"{into}/{span} XP to Level {next_lvl}" if next_lvl else "Max Level!")
+    st.markdown(f"🪙 **{stats['coins']:,}** coins &nbsp;&nbsp; 🔥 **{stats['current_streak']}** day streak")
+
+    nu = levels.next_unlock(lvl)
+    if nu:
+        feat, req_lvl, req_xp = nu
+        st.caption(f"Only {max(0, req_xp - stats['xp'])} XP until **{feat}** unlocks!")
 
     page = st.radio("Navigate", NAV_PAGES, label_visibility="collapsed", key="ff_page")
 
     st.markdown("---")
-    stats_snapshot, profile, totals = build_stats_snapshot()
-    st.markdown(f"**Streak:** {stats_snapshot['current_streak']} 🔥  \n"
-                f"**Total hours:** {totals['total_hours']}h  \n"
-                f"**XP:** {int(float(profile.get('xp','0'))):,}")
-
-    st.markdown("---")
-    with st.expander("🔑 AI Analyzer (optional)"):
+    with st.expander("🔑 Gemini API Key"):
         st.caption(
-            "The Sentence Breakdown tool uses the Claude API for real grammar "
-            "analysis. Paste your Anthropic API key to enable it — it's kept "
-            "only in this browser session, never saved to disk."
+            "AI Chat, Writing Tutor, Pronunciation Trainer, and AI Dictionary lookups "
+            "use Google's Gemini API. Paste your key below — kept only in this "
+            "browser session, never saved to disk."
         )
-        api_key = st.text_input("Anthropic API key", type="password", key="api_key_input")
+        gemini_key = st.text_input("Gemini API key", type="password", key="gemini_api_key")
 
-    if profile.get("keyboard_shortcuts", "0") == "1":
-        st.components.v1.html(
-            """
-            <script>
-            const shortcuts = {'d':'🏠 Dashboard','l':'⏱️ Log Study Time','c':'🎯 Daily Challenges','f':'🔎 Search'};
-            const handler = function(e) {
-                const active = window.parent.document.activeElement;
-                const tag = active ? active.tagName : '';
-                if (tag === 'INPUT' || tag === 'TEXTAREA') { return; }
-                const key = e.key.toLowerCase();
-                if (shortcuts[key]) {
-                    const label = shortcuts[key];
-                    const labels = window.parent.document.querySelectorAll('label');
-                    for (const el of labels) {
-                        if (el.innerText && el.innerText.trim() === label) { el.click(); break; }
-                    }
-                }
-            };
-            if (!window.parent.__ffShortcutsBound) {
-                window.parent.document.addEventListener('keydown', handler);
-                window.parent.__ffShortcutsBound = true;
-            }
-            </script>
-            """,
-            height=0,
-        )
-
-# Fire achievement / theme checks once per render, after any state changes
-newly_unlocked_themes = check_theme_unlocks(totals["total_hours"], profile)
-newly_achievements = check_achievements(stats_snapshot)
-db.maybe_earn_streak_freeze()
-
-for t in newly_unlocked_themes:
-    st.toast(f"🎉 New world unlocked: {t}!", icon="🌍")
-for a in newly_achievements:
+newly_ach = check_achievements(stats)
+for a in newly_ach:
+    db.grant_item(f"trophy_{a['key']}", "trophy", a["rarity"], via="achievement")
     st.toast(f"{a['emoji']} Achievement unlocked: {a['name']}!", icon="🏆")
 
 
 # ----------------------------------------------------------------------------
-# PAGE: Dashboard
+# PAGE: Home
 # ----------------------------------------------------------------------------
-if page == "🏠 Dashboard":
-    theme = THEMES[profile.get("current_theme", "Neon Megacity")]
+if page == "🏠 Home":
+    theme_item = sc.get_item(profile.get("equipped_theme", "light"))
+    st.markdown(f"# Willkommen zurück, {profile.get('display_name','Sprachheld')}! {theme_item['emoji'] if theme_item else ''}")
 
-    st.markdown(
-        f"""<div class="ff-hero">
-        <div style="font-size:0.85rem;opacity:.75;text-transform:uppercase;letter-spacing:.1em;">
-            {dt.date.today().strftime('%A, %d %B %Y')}
-        </div>
-        <h1 style="margin-top:0.3rem;">Willkommen zurück, {profile.get('display_name','Sprachfreund')} {theme['emoji']}</h1>
-        <div class="ff-quote">„{quote_of_day()[0]}“ — {quote_of_day()[1]}</div>
-        </div>""",
-        unsafe_allow_html=True,
-    )
-
-    motivation_msgs = intel.personalized_motivation_messages()
-    st.markdown(
-        "".join(f'<span class="ff-pill">✨ {m}</span>' for m in motivation_msgs[:3]),
-        unsafe_allow_html=True,
-    )
-    st.markdown("<div style='height:0.6rem;'></div>", unsafe_allow_html=True)
-
-    adaptive = intel.adaptive_goal_suggestion()
-    if adaptive:
-        msg, suggested = adaptive
-        c_a, c_b = st.columns([4, 1])
-        with c_a:
-            st.info(msg, icon="🎯")
-        with c_b:
-            if st.button("Apply", key="apply_adaptive_goal"):
-                db.set_profile("daily_goal_minutes", suggested)
-                st.rerun()
+    if daily_result:
+        card_start()
+        st.markdown(f"### 🎁 Day {daily_result['day_number']} Login Reward!")
+        st.markdown(f"## {daily_result['description']}")
+        st.caption(f"Current streak: {daily_result['streak']} days")
+        card_end()
+        confetti_burst(100)
+        play_sound("daily_reward", profile.get("sound_enabled", "1") == "1")
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.markdown(metric_html("Current Streak", stats_snapshot["current_streak"], " days 🔥"), unsafe_allow_html=True)
+        card_start(); st.metric("Level", stats["level"]); card_end()
     with c2:
-        st.markdown(metric_html("Total Hours", totals["total_hours"], "h"), unsafe_allow_html=True)
+        card_start(); st.metric("XP", f"{stats['xp']:,}"); card_end()
     with c3:
-        st.markdown(metric_html("This Week", totals["week_hours"], "h"), unsafe_allow_html=True)
+        card_start(); st.metric("Coins", f"{stats['coins']:,}"); card_end()
     with c4:
-        st.markdown(metric_html("This Month", totals["month_hours"], "h"), unsafe_allow_html=True)
+        card_start(); st.metric("Streak", f"{stats['current_streak']} 🔥"); card_end()
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown(metric_html("Estimated CEFR", cefr_estimate(totals["total_hours"])), unsafe_allow_html=True)
-    with c2:
-        st.markdown(metric_html("XP", f"{int(float(profile.get('xp','0'))):,}"), unsafe_allow_html=True)
-    with c3:
-        next_m, remaining = hours_to_next_milestone(totals["total_hours"])
-        label = f"{remaining:.1f}h to {next_m}h" if next_m else "All milestones reached!"
-        st.markdown(metric_html("Next Milestone", label), unsafe_allow_html=True)
+    lvl, into, span, pct, next_lvl = levels.xp_progress(stats["xp"])
+    st.markdown("### Level Progress")
+    xp_bar(pct, f"{into} / {span} XP to Level {next_lvl}" if next_lvl else "Maximum level reached!")
 
-    st.markdown("### 🔮 Progress Forecast")
-    forecast = intel.progress_forecast()
-    if forecast["next_level"]:
-        fc1, fc2 = st.columns([2, 1])
-        with fc1:
-            st.markdown(
-                f"You're **{forecast['pct_in_band']*100:.0f}%** through **{forecast['current_level']}**, "
-                f"roughly **{forecast['hours_remaining']}h** away from **{forecast['next_level']}**-level "
-                f"comprehension."
-            )
-            st.progress(forecast["pct_in_band"])
-            if forecast["weekly_pace"] > 0:
-                st.caption(
-                    f"Recent pace: {forecast['weekly_pace']}h/week. "
-                    f"At this pace: **{forecast['est_date_current_pace'].strftime('%d %b %Y')}**. "
-                    f"At 25% faster: **{forecast['est_date_faster_pace'].strftime('%d %b %Y')}**."
-                )
-            else:
-                st.caption("Log a few sessions this week to unlock a pace-based completion estimate.")
-        with fc2:
-            st.markdown(metric_html("Weekly Pace", forecast["weekly_pace"], "h/wk"), unsafe_allow_html=True)
-    else:
-        st.success("You've reached the top of our estimation scale (C2)! 🎉")
+    nu = levels.next_unlock(lvl)
+    if nu:
+        feat, req_lvl, req_xp = nu
+        remaining = max(0, req_xp - stats["xp"])
+        st.info(f"🔓 Only **{remaining} XP** until **{feat}** unlocks at Level {req_lvl}!", icon="🔓")
 
-    st.markdown("### Today's Goal")
-    goal_min = int(profile.get("daily_goal_minutes", "30") or 30)
-    today_min = totals["today_minutes"]
-    pct = min(1.0, today_min / goal_min) if goal_min else 0
-
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=today_min,
-        number={"suffix": " min", "font": {"color": theme["text"]}},
-        gauge={
-            "axis": {"range": [0, max(goal_min, today_min, 1)], "tickcolor": theme["text"]},
-            "bar": {"color": theme["accent"]},
-            "bgcolor": "rgba(255,255,255,0.05)",
-            "borderwidth": 0,
-            "steps": [{"range": [0, goal_min], "color": "rgba(255,255,255,0.08)"}],
-            "threshold": {"line": {"color": theme["accent2"], "width": 4},
-                          "thickness": 0.85, "value": goal_min},
-        },
-        title={"text": f"Daily goal: {goal_min} min", "font": {"color": theme["text"], "size": 14}},
-    ))
-    fig.update_layout(height=260, margin=dict(l=20, r=20, t=50, b=10),
-                       paper_bgcolor="rgba(0,0,0,0)", font_color=theme["text"])
-    st.plotly_chart(fig, width='stretch')
-
-    col1, col2 = st.columns([1, 1])
+    col1, col2 = st.columns(2)
     with col1:
         card_start()
-        st.markdown("#### 📖 Word of the Day")
-        w = word_of_day()
-        st.markdown(f"### {w['word']}")
-        st.caption(f"/{w['ipa']}/  ·  gender: {w['gender']}  ·  plural: {w['plural']}")
-        st.write(f"**Meaning:** {w['meaning']}")
-        st.write(f"**Example:** _{w['example']}_")
-        st.write(f"**Translation:** {w['translation']}")
-        st.write(f"**Memory tip:** {w['tip']}")
-        if st.button("💾 Save this word", key="dash_save_word"):
-            db.save_word(w["word"], w["word"], w["meaning"], w["gender"], w["plural"], w["example"])
-            st.success("Saved to your dictionary!")
+        st.markdown("#### 🐾 Your Companion")
+        pet_emoji = equipped_pet_emoji(profile)
+        if pet_emoji:
+            st.markdown(f'<div class="pet-companion" style="font-size:4rem;">{pet_emoji}</div>', unsafe_allow_html=True)
+            st.caption(f"Your pet {pet_react('happy')}")
+        else:
+            st.caption("No pet equipped yet — visit the Shop or open a Loot Chest!")
+        card_end()
+
+        card_start()
+        st.markdown("#### 📚 Unlocked Content")
+        unlocked = levels.unlocked_features(lvl)
+        st.markdown("".join(f'<span class="rpg-pill">{f}</span>' for f in unlocked), unsafe_allow_html=True)
         card_end()
 
     with col2:
         card_start()
-        st.markdown("#### 🎯 Suggested Today")
-        tier = recommendations_for_hours(totals["total_hours"])
-        st.markdown(f"Based on your **{totals['total_hours']}h** logged — you're roughly at **{tier['level']}**.")
-        for name, why in tier["items"][:3]:
-            st.markdown(f"- **{name}** — {why}")
-        st.caption("See the full Recommendations page for more.")
+        st.markdown("#### 🎯 This Week's Challenges")
+        week_start = (dt.date.today() - dt.timedelta(days=dt.date.today().weekday())).isoformat()
+        challenges = rewards.challenges_for_week(week_start)
+        db.ensure_weekly_challenges(week_start, [
+            {"key": c["key"], "target": c["target"]} for c in challenges
+        ])
+        saved_challenges = {c["challenge_key"]: c for c in db.get_weekly_challenges(week_start)}
+        for c in challenges:
+            saved = saved_challenges.get(c["key"], {})
+            progress = saved.get("progress", 0)
+            pct_c = min(1.0, progress / c["target"]) if c["target"] else 0
+            st.markdown(f"**{c['label']}**")
+            st.progress(pct_c)
+            st.caption(f"{progress:.0f} / {c['target']} {c['unit']}")
         card_end()
 
+    st.markdown("### ✨ Daily Extras")
+    extras = daily_extras.daily_extras()
+    ec1, ec2, ec3 = st.columns(3)
+    with ec1:
         card_start()
-        st.markdown("#### 🌍 Current World")
-        st.markdown(f"### {theme['emoji']} {profile.get('current_theme')}")
-        st.caption(theme["blurb"])
+        st.markdown("#### 🗣️ Idiom of the Day")
+        st.markdown(f"**{extras['idiom']}**")
+        st.caption(extras["idiom_meaning"])
         card_end()
-
-    col3, col4 = st.columns([1, 1])
-    with col3:
+    with ec2:
         card_start()
-        st.markdown("#### 🎯 Today's Challenges")
-        todays_challenges = db.get_challenges_for_date(dt.date.today().isoformat())
-        icons = {"Easy": "🟢", "Medium": "🟡", "Hard": "🔴"}
-        for c in todays_challenges:
-            status = "✅" if c["completed"] else icons.get(c["difficulty"], "•")
-            st.markdown(f"{status} **{c['title']}** ({c['xp_reward']} XP)")
-        st.caption("Head to the Daily Challenges page to complete them.")
+        st.markdown("#### 🌍 DACH Fact")
+        st.write(extras["fact"])
+        card_end()
+    with ec3:
+        card_start()
+        st.markdown("#### 💬 Quote of the Day")
+        st.markdown(f"_„{extras['quote']}“_")
+        st.caption(f"— {extras['quote_author']}")
         card_end()
 
-    with col4:
-        insight = intel.session_insight()
-        if insight:
+    st.markdown("### 📖 Continue Reading")
+    available = stories.available_stories(lvl)
+    progress = db.get_story_progress()
+    unread = [s for s in available if s["id"] not in progress or not progress[s["id"]]["completed"]]
+    if unread:
+        for s in unread[:3]:
+            st.markdown(f"- **{s['title']}** ({s['level']})")
+    else:
+        st.caption("You've completed every unlocked story — nice work! Level up for more.")
+
+
+# ----------------------------------------------------------------------------
+# PAGE: Vocabulary Quiz
+# ----------------------------------------------------------------------------
+elif page == "📚 Vocabulary Quiz":
+    st.markdown("## 📚 Vocabulary Quiz")
+    lvl = stats["level"]
+    categories = lessons.available_categories(lvl)
+
+    if "vocab_quiz" not in st.session_state:
+        st.session_state.vocab_quiz = None
+
+    category = st.selectbox("Category", categories, key="vocab_quiz_category")
+
+    if st.session_state.vocab_quiz is None or st.session_state.vocab_quiz.get("category") != category:
+        if st.button("Start Quiz", type="primary"):
+            questions = lessons.make_quiz(category, 8, random.Random())
+            st.session_state.vocab_quiz = {
+                "category": category, "questions": questions, "index": 0,
+                "score": 0, "answers": [],
+            }
+            st.rerun()
+    else:
+        quiz = st.session_state.vocab_quiz
+        idx = quiz["index"]
+        if idx < len(quiz["questions"]):
+            q = quiz["questions"][idx]
             card_start()
-            st.markdown("#### 📋 Today's Study Insight")
-            for cat, minutes in insight["by_category"].items():
-                st.markdown(f"- **{cat}:** {minutes:.0f} min")
-            st.markdown(f"- **Weekly progress:** {insight['weekly_pct']}%")
-            if insight["hours_to_next_level"] is not None:
-                st.markdown(f"- **Hours until {insight['next_level']}:** {insight['hours_to_next_level']}")
-            if insight["suggestion"]:
-                st.info(insight["suggestion"], icon="💡")
+            st.markdown(f"**Question {idx+1} / {len(quiz['questions'])}**")
+            st.markdown(f"### {q['prompt']}")
+            choice = st.radio("What does this mean?", q["options"], key=f"vocab_q_{idx}", index=None)
+            if st.button("Submit Answer", key=f"vocab_submit_{idx}"):
+                if choice is None:
+                    st.warning("Pick an answer first!")
+                else:
+                    correct = choice == q["correct"]
+                    quiz["answers"].append(correct)
+                    if correct:
+                        quiz["score"] += 1
+                        st.success(f"Correct! Your pet {pet_react('happy')}")
+                        play_sound("correct", profile.get("sound_enabled", "1") == "1")
+                    else:
+                        st.error(f"Not quite — the answer was **{q['correct']}**. Your pet {pet_react('sad')}")
+                        play_sound("incorrect", profile.get("sound_enabled", "1") == "1")
+                    quiz["index"] += 1
+                    st.rerun()
             card_end()
         else:
+            score, total = quiz["score"], len(quiz["questions"])
+            pct = score / total if total else 0
+            xp_earned = int(20 * total * pct) + (15 if pct == 1.0 else 0)
+            coins_earned = int(5 * total * pct)
+            db.record_quiz("vocabulary", quiz["category"], score, total, xp_earned)
+            db.add_xp(xp_earned, "vocabulary_quiz")
+            db.add_coins(coins_earned)
+            week_start = (dt.date.today() - dt.timedelta(days=dt.date.today().weekday())).isoformat()
+            db.bump_weekly_progress(week_start, "earn_xp", xp_earned)
+            db.bump_weekly_progress(week_start, "complete_quizzes", 1)
+
             card_start()
-            st.markdown("#### 📋 Today's Study Insight")
-            st.caption("Log a session today to see your personalized insight here.")
+            st.markdown(f"## Quiz Complete! {score}/{total}")
+            st.markdown(f"**{xp_gain_display(xp_earned, profile)}** &nbsp;&nbsp; **+{coins_earned} 🪙**")
+            if pct == 1.0:
+                st.success("🎉 Perfect score bonus applied!")
+                confetti_burst(150)
+                play_sound("level_up", profile.get("sound_enabled", "1") == "1")
+            if st.button("Take Another Quiz"):
+                st.session_state.vocab_quiz = None
+                st.rerun()
             card_end()
 
 
 # ----------------------------------------------------------------------------
-# PAGE: Log Study Time
+# PAGE: Article Trainer
 # ----------------------------------------------------------------------------
-elif page == "⏱️ Log Study Time":
-    st.markdown("## ⏱️ Log a Study Session")
-    st.caption("Every minute counts toward your total, your streak, and your next world.")
+elif page == "🔤 Article Trainer":
+    st.markdown("## 🔤 Article Trainer")
+    st.caption("der, die, or das? Timed mode with a combo multiplier.")
 
-    with st.form("log_session_form", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            session_date = st.date_input("Date", value=dt.date.today(), max_value=dt.date.today())
-            category = st.selectbox("Category", db.CATEGORIES)
-            minutes = st.number_input("Duration (minutes)", min_value=1, max_value=600, value=30, step=5)
-        with c2:
-            difficulty = st.select_slider("Difficulty", options=db.DIFFICULTIES, value="Comfortable")
-            resource = st.text_input("Resource used (optional)", placeholder="e.g. Easy German Ep. 214")
-            notes = st.text_area("Notes (optional)", placeholder="What did you learn today?")
+    if "article_game" not in st.session_state:
+        st.session_state.article_game = None
 
-        submitted = st.form_submit_button("✅ Log Session", width='stretch')
-        if submitted:
-            db.add_session(session_date.isoformat(), category, float(minutes), difficulty, resource, notes)
-            st.success(f"Logged {minutes} minutes of {category}! Great work. 🎉")
+    if st.session_state.article_game is None:
+        if st.button("Start (10 words)", type="primary"):
+            qs = [grammar.make_article_question(random.Random()) for _ in range(10)]
+            st.session_state.article_game = {"questions": qs, "index": 0, "score": 0, "combo": 0, "max_combo": 0}
             st.rerun()
-
-    st.markdown("### Recent Sessions")
-    df = db.get_all_sessions()
-    if df.empty:
-        st.info("No sessions logged yet — add your first one above!")
     else:
-        show = df[["id", "date", "category", "minutes", "difficulty", "resource", "notes"]].head(25).copy()
-        show["date"] = show["date"].dt.strftime("%Y-%m-%d")
-        st.dataframe(show, width='stretch', hide_index=True)
+        game = st.session_state.article_game
+        idx = game["index"]
+        if idx < len(game["questions"]):
+            q = game["questions"][idx]
+            card_start()
+            st.markdown(f"**Word {idx+1}/10** &nbsp;&nbsp; Combo: 🔥×{game['combo']}")
+            st.markdown(f"### ___ {q['noun']}")
+            cols = st.columns(3)
+            for i, opt in enumerate(q["options"]):
+                with cols[i]:
+                    if st.button(opt, key=f"article_{idx}_{opt}", width='stretch'):
+                        if opt == q["correct"]:
+                            game["score"] += 1
+                            game["combo"] += 1
+                            game["max_combo"] = max(game["max_combo"], game["combo"])
+                            st.success(f"Richtig! {q['correct']} {q['noun']}")
+                        else:
+                            game["combo"] = 0
+                            st.error(f"Nope — it's **{q['correct']} {q['noun']}**")
+                        game["index"] += 1
+                        st.rerun()
+            card_end()
+        else:
+            score = game["score"]
+            xp_earned = score * 8 + game["max_combo"] * 5
+            db.add_xp(xp_earned, "article_trainer")
+            db.record_quiz("article", "der/die/das", score, 10, xp_earned)
+            card_start()
+            st.markdown(f"## Done! {score}/10 correct")
+            st.markdown(f"Best combo: 🔥×{game['max_combo']} &nbsp;&nbsp; **{xp_gain_display(xp_earned, profile)}**")
+            if st.button("Play Again"):
+                st.session_state.article_game = None
+                st.rerun()
+            card_end()
 
-        del_id = st.number_input("Delete session by ID", min_value=0, value=0, step=1)
-        if st.button("🗑️ Delete") and del_id:
-            db.delete_session(int(del_id))
-            st.success(f"Deleted session {int(del_id)}.")
+
+# ----------------------------------------------------------------------------
+# PAGE: Verb Trainer
+# ----------------------------------------------------------------------------
+elif page == "🔀 Verb Trainer":
+    st.markdown("## 🔀 Verb Trainer")
+    st.caption("Practice conjugation. Requires Level 7+ (unlocked once you get there).")
+
+    if not levels.is_unlocked("Verb Trainer", stats["level"]):
+        st.warning(f"🔒 Verb Trainer unlocks at Level 7. You're currently Level {stats['level']}.")
+    else:
+        mode = st.selectbox("Mode", ["mixed", "weak", "strong"], format_func=lambda m: {
+            "mixed": "Mixed", "weak": "Weak Verbs (regular)", "strong": "Strong Verbs (irregular)",
+        }[m])
+
+        if "verb_game" not in st.session_state:
+            st.session_state.verb_game = None
+
+        if st.session_state.verb_game is None or st.session_state.verb_game.get("mode") != mode:
+            if st.button("Start (10 questions)", type="primary"):
+                qs = [grammar.make_verb_question(mode, random.Random()) for _ in range(10)]
+                st.session_state.verb_game = {"mode": mode, "questions": qs, "index": 0, "score": 0}
+                st.rerun()
+        else:
+            game = st.session_state.verb_game
+            idx = game["index"]
+            if idx < len(game["questions"]):
+                q = game["questions"][idx]
+                card_start()
+                st.markdown(f"**Question {idx+1}/10**")
+                st.markdown(f"### {q['pronoun']} ___ ({q['verb']})")
+                answer = st.text_input("Your answer", key=f"verb_answer_{idx}")
+                if st.button("Submit", key=f"verb_submit_{idx}"):
+                    correct = answer.strip().lower() == q["correct"].lower()
+                    if correct:
+                        game["score"] += 1
+                        st.success("Richtig!")
+                    else:
+                        st.error(f"The correct form was **{q['correct']}**")
+                    game["index"] += 1
+                    st.rerun()
+                card_end()
+            else:
+                score = game["score"]
+                xp_earned = score * 10
+                db.add_xp(xp_earned, "verb_trainer")
+                db.record_quiz("verb", mode, score, 10, xp_earned)
+                card_start()
+                st.markdown(f"## Done! {score}/10 correct — **{xp_gain_display(xp_earned, profile)}**")
+                if st.button("Play Again"):
+                    st.session_state.verb_game = None
+                    st.rerun()
+                card_end()
+
+
+# ----------------------------------------------------------------------------
+# PAGE: Grammar Explorer
+# ----------------------------------------------------------------------------
+elif page == "📝 Grammar Explorer":
+    st.markdown("## 📝 Grammar Explorer")
+
+    if not levels.is_unlocked("Intermediate Grammar", stats["level"]):
+        st.warning(f"🔒 Full Grammar Explorer unlocks at Level 10 (Intermediate Grammar). "
+                   f"You're currently Level {stats['level']} — basic topics below are still open to browse.")
+
+    for topic, data in grammar.GRAMMAR_TREE.items():
+        locked = stats["level"] < data["min_level"] and not levels.is_unlocked("Intermediate Grammar", stats["level"])
+        with st.expander(f"{'🔒 ' if locked else ''}{topic}", expanded=False):
+            if locked:
+                st.caption(f"Unlocks at Level {data['min_level']}.")
+                continue
+            for lesson in data["lessons"]:
+                st.markdown(f"#### {lesson['title']}")
+                st.write(lesson["body"])
+                for ex in lesson["examples"]:
+                    st.markdown(f"- _{ex}_")
+            st.markdown("##### Mini Quiz")
+            for qi, q in enumerate(data["quiz"]):
+                choice = st.radio(q["q"], q["options"], key=f"grammar_{topic}_{qi}", index=None)
+                if choice is not None:
+                    if choice == q["correct"]:
+                        st.success("Correct!")
+                    else:
+                        st.error(f"Not quite — the answer is **{q['correct']}**")
+
+
+# ----------------------------------------------------------------------------
+# PAGE: Reading Stories
+# ----------------------------------------------------------------------------
+elif page == "📖 Reading Stories":
+    st.markdown("## 📖 Reading Stories")
+    st.caption(
+        "Click any highlighted vocabulary word below a story to see its definition "
+        "and save it to your dictionary. (Only the listed vocab words are clickable — "
+        "full free-text lookup for every word would need a live dictionary API.)"
+    )
+
+    available = stories.available_stories(stats["level"])
+    progress = db.get_story_progress()
+
+    if "reading_story_id" not in st.session_state:
+        st.session_state.reading_story_id = None
+
+    if st.session_state.reading_story_id is None:
+        level_filter = st.multiselect("Filter by CEFR level", ["A1", "A2", "B1", "B2"])
+        shown = [s for s in available if not level_filter or s["level"] in level_filter]
+        for s in shown:
+            done = progress.get(s["id"], {}).get("completed")
+            card_start()
+            st.markdown(f"#### {'✅ ' if done else ''}{s['title']} — {s['level']}")
+            st.caption(f"{len(s['text'].split())} words · {len(s['vocab'])} vocab words")
+            if st.button("Read", key=f"read_{s['id']}"):
+                st.session_state.reading_story_id = s["id"]
+                st.rerun()
+            card_end()
+    else:
+        story = stories.get_story(st.session_state.reading_story_id)
+        if st.button("← Back to stories"):
+            st.session_state.reading_story_id = None
             st.rerun()
 
-    st.markdown("### 📝 Study Notes")
-    st.caption("Freeform notes — searchable from the Search page, saved instantly.")
-    note_text = st.text_area("Add a note", key="note_input", placeholder="Anything you want to remember...")
-    if st.button("Save Note") and note_text.strip():
-        db.add_note(dt.date.today().isoformat(), note_text.strip())
-        st.success("Note saved!")
-        st.rerun()
-    notes_df = db.get_notes()
-    if not notes_df.empty:
-        st.dataframe(notes_df[["date", "content"]].head(10), width='stretch', hide_index=True)
-
-
-# ----------------------------------------------------------------------------
-# PAGE: Daily Challenges
-# ----------------------------------------------------------------------------
-elif page == "🎯 Daily Challenges":
-    st.markdown("## 🎯 Daily Challenges")
-    st.caption("Three fresh challenges every day, scaled to your recent activity. Complete them for bonus XP.")
-
-    today_str = dt.date.today().isoformat()
-    challenges = intel.generate_daily_challenges()
-    icons = {"Easy": "🟢", "Medium": "🟡", "Hard": "🔴"}
-
-    for c in challenges:
         card_start()
-        c1, c2 = st.columns([5, 1])
-        with c1:
-            st.markdown(f"### {icons.get(c['difficulty'], '•')} {c['difficulty']} — {c['title']}")
-            st.write(c["description"])
-            st.caption(f"Reward: {c['xp_reward']} XP")
-        with c2:
-            if c["completed"]:
-                st.success("Done ✅")
+        st.markdown(f"# {story['title']}")
+        st.caption(f"CEFR {story['level']}")
+        st.write(story["text"])
+        card_end()
+
+        col1, col2 = st.columns(2)
+        with col1:
+            card_start()
+            st.markdown("#### 📘 Vocabulary")
+            for word, meaning in story["vocab"]:
+                c1, c2 = st.columns([3, 1])
+                with c1:
+                    st.markdown(f"**{word}** — {meaning}")
+                with c2:
+                    if st.button("💾", key=f"save_vocab_{story['id']}_{word}"):
+                        db.add_vocab(word, meaning, tag=story["title"])
+                        st.toast(f"Saved {word}!")
+            card_end()
+        with col2:
+            card_start()
+            st.markdown("#### ✏️ Grammar Notes")
+            st.write(story["grammar_notes"])
+            card_end()
+
+        st.markdown("### ❓ Comprehension Questions")
+        answers = {}
+        for qi, q in enumerate(story["questions"]):
+            answers[qi] = st.radio(q["q"], q["options"], key=f"story_q_{story['id']}_{qi}", index=None)
+
+        if st.button("Submit Answers", type="primary"):
+            if any(a is None for a in answers.values()):
+                st.warning("Please answer every question first.")
             else:
-                if st.button("Complete", key=f"complete_{c['id']}"):
-                    xp = db.complete_challenge(c["id"])
-                    if xp:
-                        st.balloons()
-                        st.success(f"+{xp} XP! Great work.")
+                correct_count = sum(
+                    1 for qi, q in enumerate(story["questions"]) if answers[qi] == q["correct"]
+                )
+                score_pct = int(100 * correct_count / len(story["questions"]))
+                already_done = story["id"] in progress and progress[story["id"]]["completed"]
+                db.mark_story_complete(story["id"], score_pct)
+                if not already_done:
+                    xp_earned = 40 + score_pct // 2
+                    db.add_xp(xp_earned, "reading_story")
+                    db.add_coins(15)
+                    week_start = (dt.date.today() - dt.timedelta(days=dt.date.today().weekday())).isoformat()
+                    db.bump_weekly_progress(week_start, "finish_stories", 1)
+                    st.success(f"Comprehension: {score_pct}%! {xp_gain_display(xp_earned, profile)}, +15 🪙")
+                    if score_pct == 100:
+                        confetti_burst(120)
+                else:
+                    st.info(f"Comprehension: {score_pct}%. (Already completed once — no repeat rewards.)")
+
+
+# ----------------------------------------------------------------------------
+# PAGE: Flashcards (Spaced Repetition)
+# ----------------------------------------------------------------------------
+elif page == "🃏 Flashcards":
+    st.markdown("## 🃏 Flashcards — Spaced Repetition")
+    st.caption("Real SM-2 spaced repetition: cards you know well come back less often; cards you miss come back sooner.")
+
+    due_df = db.get_due_flashcards(limit=20)
+
+    if "flashcard_queue" not in st.session_state or st.session_state.get("flashcard_queue_stale", True):
+        st.session_state.flashcard_queue = due_df.to_dict("records")
+        st.session_state.flashcard_queue_stale = False
+        st.session_state.flashcard_show_answer = False
+
+    queue = st.session_state.flashcard_queue
+
+    if not queue:
+        st.info("No flashcards due right now! Save more words (from Reading Stories or the Dictionary) "
+                 "or check back later as your reviews come due.")
+    else:
+        card = queue[0]
+        card_start()
+        st.markdown(f"**{len(queue)} card(s) due**")
+        st.markdown(f"# {card['word']}")
+        if not st.session_state.flashcard_show_answer:
+            if st.button("Show Answer", type="primary"):
+                st.session_state.flashcard_show_answer = True
+                st.rerun()
+        else:
+            st.markdown(f"### {card['meaning']}")
+            if card["gender"] and card["gender"] != "—":
+                st.caption(f"Gender: {card['gender']}")
+            if card["example"]:
+                st.caption(f"_{card['example']}_")
+
+            st.markdown("How well did you know this?")
+            cols = st.columns(4)
+            grade_labels = [("Forgot", 1), ("Hard", 3), ("Good", 4), ("Easy", 5)]
+            for i, (label, grade) in enumerate(grade_labels):
+                with cols[i]:
+                    if st.button(label, key=f"grade_{card['id']}_{grade}", width='stretch'):
+                        new_ease, new_interval, new_reps, new_state = sm2(
+                            card["ease"], card["interval_days"], card["repetitions"], grade,
+                        )
+                        due = next_due_date(new_interval)
+                        db.update_flashcard_srs(card["id"], new_ease, new_interval, new_reps, due, new_state)
+                        db.add_xp(5, "flashcard_review")
+                        st.session_state.flashcard_queue = queue[1:]
+                        st.session_state.flashcard_show_answer = False
                         st.rerun()
         card_end()
 
-    stats = db.challenge_completion_stats()
-    if stats["total"]:
-        st.markdown("### Lifetime Challenge Stats")
-        pct = stats["completed"] / stats["total"]
-        st.progress(pct)
-        st.caption(f"{stats['completed']} / {stats['total']} challenges completed ({pct*100:.0f}%)")
+    if st.button("🔄 Refresh queue"):
+        st.session_state.flashcard_queue_stale = True
+        st.rerun()
 
 
 # ----------------------------------------------------------------------------
-# PAGE: World Themes
+# PAGE: Vocabulary Manager
 # ----------------------------------------------------------------------------
-elif page == "🌍 World Themes":
-    st.markdown("## 🌍 World Themes")
-    st.caption("Unlock new worlds as your logged hours grow. Switch anytime between unlocked worlds.")
+elif page == "📇 Vocabulary Manager":
+    st.markdown("## 📇 Vocabulary Manager")
 
-    unlocked = unlocked_theme_list(profile)
-    cols = st.columns(3)
-    for i, (name, meta) in enumerate(THEMES.items()):
-        with cols[i % 3]:
-            is_unlocked = name in unlocked
-            is_current = name == profile.get("current_theme")
-            st.markdown(
-                f"""<div class="ff-card" style="background:{meta['gradient']};
-                    opacity:{1 if is_unlocked else 0.55};">
-                    <div style="font-size:2rem;">{meta['emoji']}</div>
-                    <h4 style="color:{meta['text']};margin:0.2rem 0;">{name}</h4>
-                    <div style="color:{meta['text']};opacity:.85;font-size:0.85rem;">{meta['blurb']}</div>
-                    <div style="margin-top:0.6rem;color:{meta['text']};font-size:0.78rem;">
-                        {'✅ Unlocked' if is_unlocked else f"🔒 Unlocks at {meta['unlock_hours']}h"}
-                    </div>
-                </div>""",
-                unsafe_allow_html=True,
-            )
-            if is_unlocked and not is_current:
-                if st.button(f"Switch to {name}", key=f"switch_{name}"):
-                    db.set_profile("current_theme", name)
-                    st.rerun()
-            elif is_current:
-                st.success("Currently active", icon="✨")
-
-
-# ----------------------------------------------------------------------------
-# PAGE: Word of the Day (full archive)
-# ----------------------------------------------------------------------------
-elif page == "📖 Word of the Day":
-    st.markdown("## 📖 Word of the Day")
-    w = word_of_day()
-    card_start()
-    st.markdown(f"# {w['word']}")
-    st.caption(f"IPA: /{w['ipa']}/")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.write(f"**Gender:** {w['gender']}")
-        st.write(f"**Plural:** {w['plural']}")
-        st.write(f"**Meaning:** {w['meaning']}")
-        st.write(f"**Related words:** {w['related']}")
-    with c2:
-        st.write(f"**Example:** _{w['example']}_")
-        st.write(f"**Translation:** {w['translation']}")
-        st.write(f"**Memory tip:** 💡 {w['tip']}")
-    if st.button("💾 Save to Dictionary"):
-        db.save_word(w["word"], w["word"], w["meaning"], w["gender"], w["plural"], w["example"])
-        st.success("Saved!")
-    card_end()
-
-    st.markdown("### Word Archive")
-    for word in WORD_BANK:
-        with st.expander(f"{word['word']} — {word['meaning']}"):
-            st.write(f"IPA: /{word['ipa']}/ · Gender: {word['gender']} · Plural: {word['plural']}")
-            st.write(f"Example: _{word['example']}_ → {word['translation']}")
-            st.write(f"Tip: {word['tip']}")
-            if st.button("Save", key=f"save_archive_{word['word']}"):
-                db.save_word(word["word"], word["word"], word["meaning"], word["gender"], word["plural"], word["example"])
-                st.success("Saved!")
-
-
-# ----------------------------------------------------------------------------
-# PAGE: Sentence Breakdown
-# ----------------------------------------------------------------------------
-elif page == "🔍 Sentence Breakdown":
-    st.markdown("## 🔍 Sentence Breakdown Tool")
-    st.caption("Paste a German sentence to see it decomposed word-by-word, with grammar and translation notes.")
-
-    sentence = st.text_area(
-        "German sentence",
-        value="Ich habe gestern mit meiner Freundin im Park gesprochen.",
-        height=90,
-    )
-    key_from_sidebar = st.session_state.get("api_key_input", "")
-    use_ai = bool(key_from_sidebar)
-
-    if not use_ai:
-        st.info(
-            "No Anthropic API key set — using offline mode (limited to a small "
-            "built-in dictionary, no grammar synthesis). Add a key in the sidebar "
-            "under **AI Analyzer** for full grammar analysis.",
-            icon="ℹ️",
-        )
-
-    if st.button("Analyze Sentence", type="primary"):
-        if not sentence.strip():
-            st.warning("Please enter a sentence.")
-        else:
-            with st.spinner("Analyzing..."):
-                try:
-                    if use_ai:
-                        result = analyze_with_claude(sentence.strip(), key_from_sidebar)
-                    else:
-                        result = analyze_offline(sentence.strip())
-                except Exception as e:
-                    st.error(f"AI analysis failed ({e}). Falling back to offline mode.")
-                    result = analyze_offline(sentence.strip())
-
-            st.markdown("### Word-by-Word Breakdown")
-            wdf = pd.DataFrame(result.get("words", []))
-            if not wdf.empty:
-                wdf = wdf.rename(columns={
-                    "word": "Word", "base_form": "Base Form",
-                    "meaning": "Meaning", "grammar": "Grammar",
-                })
-                st.dataframe(wdf, width='stretch', hide_index=True)
-
-            c1, c2 = st.columns(2)
-            with c1:
-                card_start()
-                st.markdown("**Cases**")
-                st.write(result.get("cases_explained", "—"))
-                st.markdown("**Word Order**")
-                st.write(result.get("word_order_notes", "—"))
-                st.markdown("**Separable Verbs**")
-                st.write(result.get("separable_verbs", "—"))
-                card_end()
-            with c2:
-                card_start()
-                st.markdown("**Idioms**")
-                st.write(result.get("idioms", "—"))
-                st.markdown("**Literal Translation**")
-                st.write(result.get("literal_translation", "—"))
-                st.markdown("**Natural Translation**")
-                st.write(result.get("natural_translation", "—"))
-                card_end()
-
-            if result.get("difficulty_notes"):
-                st.info(result["difficulty_notes"], icon="🎓")
-
-
-# ----------------------------------------------------------------------------
-# PAGE: Dictionary
-# ----------------------------------------------------------------------------
-elif page == "📚 Dictionary":
-    st.markdown("## 📚 Your Smart Dictionary")
-
-    tab1, tab2 = st.tabs(["Saved Words", "Quick Lookup"])
-
-    with tab1:
-        words_df = db.get_saved_words()
-        if words_df.empty:
-            st.info("No saved words yet. Save words from the Word of the Day or Sentence Breakdown pages.")
-        else:
-            collections = ["All"] + sorted(words_df["collection"].dropna().unique().tolist())
-            chosen = st.selectbox("Collection", collections)
-            view = words_df if chosen == "All" else words_df[words_df["collection"] == chosen]
-            st.dataframe(
-                view[["id", "word", "meaning", "gender", "plural", "example", "collection"]],
-                width='stretch', hide_index=True,
-            )
-            del_id = st.number_input("Delete word by ID", min_value=0, value=0, step=1)
-            if st.button("🗑️ Delete word") and del_id:
-                db.delete_word(int(del_id))
-                st.rerun()
-
-    with tab2:
-        st.caption("Searches the small built-in reference dictionary (also used by offline sentence analysis).")
-        query = st.text_input("Look up a German word")
-        if query:
-            entry = MINI_DICTIONARY.get(query) or MINI_DICTIONARY.get(query.lower())
-            if entry:
-                st.markdown(f"### {query}")
-                st.write(f"**Meaning:** {entry['meaning']}")
-                st.write(f"**Gender:** {entry['gender']}  ·  **CEFR:** {entry['cefr']}")
-                st.write(f"**Example:** _{entry['example']}_")
-                st.write(f"**Synonyms:** {entry['synonyms']}")
-                st.write(f"**Compound words:** {entry['compound']}")
-                if st.button("💾 Save this word"):
-                    db.save_word(query, query, entry["meaning"], entry["gender"], "—", entry["example"])
-                    st.success("Saved!")
-            else:
-                st.warning("Not found in the built-in dictionary. Try the Sentence Breakdown tool with an AI key for broader coverage.")
-
-
-# ----------------------------------------------------------------------------
-# PAGE: Recommendations
-# ----------------------------------------------------------------------------
-elif page == "🧭 Recommendations":
-    st.markdown("## 🧭 Personalized Resource Engine")
-    st.caption(
-        "Recommendations adapt to your logged hours and topic interests, and avoid repeating "
-        "resources you've already completed. Links go to the resource's real homepage/channel "
-        "(not a single video/article) since those stay valid — no dead links."
-    )
-
-    hours = totals["total_hours"]
-    tier = recommendations_for_hours(hours)
-    st.markdown(f"### You've logged **{hours}h** — estimated readiness: **{tier['level']}**")
-
-    topic_filters = st.multiselect("Filter by topic", TOPIC_FILTERS, key="rec_topic_filters")
-    completed_ids = db.completed_resource_ids()
-    picks = res.resources_for(hours, topics_filter=topic_filters, exclude_ids=set(), limit=8)
-
-    for r in picks:
-        db.mark_resource_shown(r["id"])
-        already_done = r["id"] in completed_ids
-        card_start()
-        c1, c2 = st.columns([4, 1])
-        with c1:
-            st.markdown(f"#### {r['title']} {'✅' if already_done else ''}")
-            st.write(r["desc"])
-            st.caption(
-                f"Category: {r['category']} · Difficulty: {r['difficulty']} · "
-                f"~{r['duration']} · Est. comprehension: {r['comprehension_pct']}% · "
-                f"Topics: {', '.join(r['topics'])}"
-            )
-            st.caption(res.why_selected(r, hours))
-        with c2:
-            st.link_button("Open ↗", r["url"], width='stretch')
-            if st.button("Mark done", key=f"done_{r['id']}"):
-                db.mark_resource_completed(r["id"])
-                st.rerun()
-            if st.button("⭐ Favorite", key=f"fav_{r['id']}"):
-                db.add_favorite(r["category"], r["title"], r["url"], r["desc"])
-                st.toast("Added to Favorites!")
-        card_end()
-
-    st.markdown("### Full Roadmap (by hours)")
-    for t in RECOMMENDATION_ROADMAP:
-        active = t is tier
-        label = f"**{t['level']}** ({t['min_hours']}–{t['max_hours'] if t['max_hours'] < 999999 else '∞'}h)"
-        with st.expander(f"{'👉 ' if active else ''}{label}", expanded=active):
-            for name, why in t["items"]:
-                st.markdown(f"- **{name}** — {why}")
-
-
-# ----------------------------------------------------------------------------
-# PAGE: Study Planner
-# ----------------------------------------------------------------------------
-elif page == "📆 Study Planner":
-    st.markdown("## 📆 Smart Study Planner")
-    st.caption("A weekly rhythm you can edit anytime. Missed a day? Just study when you can — nothing resets.")
-
-    plan = db.get_study_plan()
-    for row in plan:
-        c1, c2, c3 = st.columns([1.2, 3, 1.5])
-        with c1:
-            st.markdown(f"**{row['day_of_week']}**")
-        with c2:
-            new_activity = st.text_input(
-                "Activity", value=row["activity"] or "", key=f"plan_act_{row['day_of_week']}",
-                label_visibility="collapsed",
-            )
-        with c3:
-            new_minutes = st.number_input(
-                "Minutes", value=int(row["minutes"] or 0), min_value=0, max_value=300, step=5,
-                key=f"plan_min_{row['day_of_week']}", label_visibility="collapsed",
-            )
-        if new_activity != row["activity"] or new_minutes != row["minutes"]:
-            db.set_study_plan_day(row["day_of_week"], new_activity, new_minutes)
-
-    st.caption("Changes save automatically — no submit button needed.")
-
-    st.markdown("### This Week So Far")
-    df = db.get_all_sessions()
-    if not df.empty:
-        today = dt.date.today()
-        week_start = today - dt.timedelta(days=today.weekday())
-        week_df = df[df["date"] >= pd.Timestamp(week_start)]
-        done_days = set(week_df["date"].dt.day_name())
-        cols = st.columns(7)
-        order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        for i, day in enumerate(order):
-            with cols[i]:
-                status = "✅" if day in done_days else ("📅" if today.strftime("%A") == day else "⚪")
-                st.markdown(f"<div style='text-align:center;'>{status}<br><small>{day[:3]}</small></div>",
-                             unsafe_allow_html=True)
-
-
-# ----------------------------------------------------------------------------
-# PAGE: Weekly Reflection
-# ----------------------------------------------------------------------------
-elif page == "🪞 Weekly Reflection":
-    st.markdown("## 🪞 Weekly AI Reflection")
-    st.caption("A personalized report generated at the end of each week from your actual logged data.")
-
-    past_week_start = intel.most_recent_complete_week_start()
-    report = intel.generate_weekly_reflection(past_week_start)
-
-    if not report:
-        st.info("No sessions logged in the most recent complete week yet — log some study time to unlock your first report!")
+    vocab_df = db.get_vocab_df()
+    if vocab_df.empty:
+        st.info("No saved words yet. Save some from Reading Stories, Flashcards, or the AI Dictionary lookup.")
     else:
-        card_start()
-        st.markdown(f"### Week of {report['week_start']}")
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.markdown(metric_html("Hours this week", report["total_hours"], "h"), unsafe_allow_html=True)
+            search = st.text_input("Search", placeholder="Search words or meanings...")
         with c2:
-            trend = "📈 improved" if report["improved"] else "📉 lighter"
-            st.markdown(metric_html("Vs. previous week", trend), unsafe_allow_html=True)
+            tags = ["All"] + sorted(vocab_df["tag"].dropna().unique().tolist())
+            tag_filter = st.selectbox("Filter by tag", tags)
         with c3:
-            st.markdown(metric_html("Consistency", f"{report['consistency_pct']}%"), unsafe_allow_html=True)
+            state_filter = st.selectbox("Filter by SRS state", ["All", "New", "Learning", "Review", "Mastered"])
 
-        st.markdown(f"**Strongest skill:** {report['strongest_skill']}")
-        st.markdown(f"**Weakest / least-practiced skill:** {report['weakest_skill']}")
-        st.markdown(f"**Most productive day:** {report['most_productive_day']}")
-        st.markdown(f"**Most productive method:** {report['most_productive_method']}")
-        if report["milestone_reached"]:
-            st.success(f"🏅 You crossed the {report['milestone_reached']}-hour milestone this week!")
-        st.markdown(f"**Recommended focus next week:** {report['recommended_focus']}")
-        st.info(f"**Suggested challenge:** {report['suggested_challenge']}", icon="🎯")
-        card_end()
+        view = vocab_df.copy()
+        if search:
+            mask = view["word"].str.contains(search, case=False, na=False) | view["meaning"].str.contains(search, case=False, na=False)
+            view = view[mask]
+        if tag_filter != "All":
+            view = view[view["tag"] == tag_filter]
+        if state_filter != "All":
+            view = view[view["srs_state"] == state_filter]
 
-    past_reports = db.get_all_weekly_reflections()
-    if len(past_reports) > 1:
-        st.markdown("### Past Reports")
-        for week_start_str, r in past_reports[1:]:
-            with st.expander(f"Week of {week_start_str} — {r['total_hours']}h"):
-                st.write(f"Strongest: {r['strongest_skill']} · Focus next: {r['recommended_focus']}")
+        only_favorites = st.checkbox("⭐ Favorites only")
+        if only_favorites:
+            view = view[view["favorite"] == 1]
 
-
-# ----------------------------------------------------------------------------
-# PAGE: Learning Profile
-# ----------------------------------------------------------------------------
-elif page == "🧬 Learning Profile":
-    st.markdown("## 🧬 Personal Learning Profile")
-    st.caption("Continuously derived from your actual study sessions — the more you log, the sharper this gets.")
-
-    lp = intel.derive_learning_profile()
-    if not lp:
-        st.info("Log a few sessions to build your learning profile.")
-    else:
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown(metric_html("Favorite method (most sessions)", lp["favorite_method"]), unsafe_allow_html=True)
-            st.markdown(metric_html("Average session length", lp["avg_session_minutes"], " min"), unsafe_allow_html=True)
-            st.markdown(metric_html("Favorite study day", lp["favorite_day"]), unsafe_allow_html=True)
-        with c2:
-            st.markdown(metric_html("Most successful method (most hours)", lp["most_successful_method"]), unsafe_allow_html=True)
-            st.markdown(metric_html("Longest single session", f"{lp['longest_session_minutes']:.0f}", f" min ({lp['longest_session_category']})"), unsafe_allow_html=True)
-            st.markdown(metric_html("Total sessions logged", lp["total_sessions"]), unsafe_allow_html=True)
-
-        st.caption(
-            "Note: 'most difficult grammar topics' and 'preferred learning times of day' would need "
-            "richer session metadata (e.g. time-of-day logging, per-session difficulty feedback on "
-            "grammar points) than is currently captured — everything shown above is derived from what "
-            "you've actually logged, nothing is guessed."
+        st.dataframe(
+            view[["id", "word", "meaning", "gender", "tag", "srs_state", "due_date", "favorite"]],
+            width='stretch', hide_index=True,
         )
 
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            fav_id = st.number_input("Toggle favorite (ID)", min_value=0, value=0, step=1)
+            if st.button("⭐ Toggle") and fav_id:
+                db.toggle_favorite(int(fav_id))
+                st.rerun()
+        with c2:
+            del_id = st.number_input("Delete word (ID)", min_value=0, value=0, step=1)
+            if st.button("🗑️ Delete") and del_id:
+                db.delete_vocab(int(del_id))
+                st.rerun()
+        with c3:
+            anki_csv = view[["word", "meaning"]].to_csv(index=False, header=False)
+            st.download_button("⬇️ Export to Anki (CSV)", anki_csv, file_name="vocab_anki_export.csv", mime="text/csv")
+
 
 # ----------------------------------------------------------------------------
-# PAGE: Timeline
+# PAGE: AI Chat (Conversation Mode)
 # ----------------------------------------------------------------------------
-elif page == "🕰️ Timeline":
-    st.markdown("## 🕰️ Your Learning Timeline")
-    st.caption("A chronological record of your journey — milestones are recorded automatically as you reach them.")
+elif page == "💬 AI Chat":
+    st.markdown("## 💬 AI Conversation Mode")
+    st.caption("Powered by Gemini. Roleplay a scenario in German — mistakes get gently corrected in-character.")
 
-    timeline_df = db.get_timeline()
-    if timeline_df.empty:
-        st.info("Your timeline will start filling in as soon as you log your first session.")
+    if not gemini_key:
+        st.warning("Add your Gemini API key in the sidebar to use AI Chat.")
     else:
-        for _, row in timeline_df.sort_values("occurred_at", ascending=False).iterrows():
-            card_start()
-            occurred = pd.to_datetime(row["occurred_at"]).strftime("%d %B %Y")
-            st.markdown(f"#### {row['icon']} {row['title']}")
-            st.caption(occurred)
-            if row["description"]:
-                st.write(row["description"])
-            card_end()
+        roleplay_unlocked = levels.is_unlocked("AI Roleplay", stats["level"])
+        available_scenarios = list(gt.SCENARIOS.keys()) if roleplay_unlocked else ["Restaurant", "Ordering Coffee", "Shopping"]
+        if not roleplay_unlocked:
+            st.caption(f"Basic scenarios unlocked. Full AI Roleplay (all scenarios) unlocks at Level 20 "
+                       f"— you're Level {stats['level']}.")
 
+        scenario = st.selectbox("Scenario", available_scenarios)
+        history = db.get_conversation(scenario)
 
-# ----------------------------------------------------------------------------
-# PAGE: Favorites
-# ----------------------------------------------------------------------------
-elif page == "⭐ Favorites":
-    st.markdown("## ⭐ Favorites Library")
-    st.caption("Bookmark anything useful — resources, articles, your own notes about grammar points, etc.")
+        for turn in history:
+            with st.chat_message("user" if turn["role"] == "user" else "assistant"):
+                st.write(turn["content"])
 
-    with st.expander("➕ Add a favorite manually"):
-        f_type = st.selectbox("Type", ["video", "article", "podcast", "book", "grammar", "other"])
-        f_title = st.text_input("Title")
-        f_url = st.text_input("URL (optional)")
-        f_notes = st.text_area("Notes (optional)")
-        if st.button("Save Favorite") and f_title.strip():
-            db.add_favorite(f_type, f_title.strip(), f_url.strip(), f_notes.strip())
-            st.success("Saved!")
+        user_msg = st.chat_input("Type your message in German...")
+        if user_msg:
+            db.add_conversation_message(scenario, "user", user_msg)
+            with st.chat_message("user"):
+                st.write(user_msg)
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    try:
+                        reply = gt.conversation_reply(gemini_key, scenario, history, user_msg)
+                    except Exception as e:
+                        reply = f"(AI error: {e})"
+                st.write(reply)
+            db.add_conversation_message(scenario, "model", reply)
+            db.add_xp(10, "ai_chat")
             st.rerun()
 
-    favs = db.get_favorites()
-    if favs.empty:
-        st.info("No favorites yet. Add resources from the Recommendations page or manually above.")
+        if st.button("🗑️ Clear conversation"):
+            db.clear_conversation(scenario)
+            st.rerun()
+
+
+# ----------------------------------------------------------------------------
+# PAGE: AI Writing Tutor
+# ----------------------------------------------------------------------------
+elif page == "✍️ AI Writing Tutor":
+    st.markdown("## ✍️ AI Writing Tutor")
+    st.caption("Write a paragraph in German. Gemini returns grammar corrections, vocabulary "
+               "improvements, natural phrasing notes, and alternatives.")
+
+    if not gemini_key:
+        st.warning("Add your Gemini API key in the sidebar to use the Writing Tutor.")
     else:
-        types = ["All"] + sorted(favs["item_type"].unique().tolist())
-        chosen_type = st.selectbox("Filter by type", types)
-        view = favs if chosen_type == "All" else favs[favs["item_type"] == chosen_type]
-        for _, row in view.iterrows():
+        paragraph = st.text_area("Your German paragraph", height=150,
+                                  placeholder="Schreibe hier ein paar Sätze auf Deutsch...")
+        if st.button("Get Feedback", type="primary") and paragraph.strip():
+            with st.spinner("Analyzing your writing..."):
+                try:
+                    feedback = gt.writing_tutor_feedback(gemini_key, paragraph.strip())
+                except Exception as e:
+                    st.error(f"AI error: {e}")
+                    feedback = None
+
+            if feedback:
+                db.add_xp(25, "writing_tutor")
+                card_start()
+                st.markdown("#### ✅ Corrected Text")
+                st.write(feedback.get("corrected_text", "—"))
+                card_end()
+
+                if feedback.get("grammar_corrections"):
+                    st.markdown("#### 📝 Grammar Corrections")
+                    for gc in feedback["grammar_corrections"]:
+                        st.markdown(f"- ~~{gc['original']}~~ → **{gc['corrected']}** — {gc['explanation']}")
+
+                if feedback.get("vocabulary_improvements"):
+                    st.markdown("#### 📚 Vocabulary Improvements")
+                    for vi in feedback["vocabulary_improvements"]:
+                        st.markdown(f"- {vi['original']} → **{vi['improved']}** — {vi['why']}")
+
+                if feedback.get("natural_phrasing_notes"):
+                    st.markdown("#### 🗣️ Natural Phrasing")
+                    st.write(feedback["natural_phrasing_notes"])
+
+                if feedback.get("alternative_expressions"):
+                    st.markdown("#### 💡 Alternative Expressions")
+                    for alt in feedback["alternative_expressions"]:
+                        st.markdown(f"- {alt}")
+
+                st.info(feedback.get("overall_feedback", ""), icon="🎓")
+
+
+# ----------------------------------------------------------------------------
+# PAGE: Pronunciation Trainer
+# ----------------------------------------------------------------------------
+elif page == "🎤 Pronunciation Trainer":
+    st.markdown("## 🎤 Pronunciation Trainer")
+
+    if not levels.is_unlocked("Pronunciation Practice", stats["level"]):
+        st.warning(f"🔒 Unlocks at Level 3. You're currently Level {stats['level']}.")
+    elif not gemini_key:
+        st.warning("Add your Gemini API key in the sidebar to use the Pronunciation Trainer.")
+    else:
+        st.caption(
+            "Best-effort feature: Gemini listens to your recording and gives a qualitative "
+            "assessment. This is an AI estimate, not a calibrated phonetic scoring system — "
+            "treat the score as a rough guide, not a precise measurement."
+        )
+        practice_sentences = [
+            "Ich möchte einen Kaffee bestellen, bitte.",
+            "Wo ist der nächste Bahnhof?",
+            "Das Wetter ist heute wirklich schön.",
+            "Können Sie mir bitte helfen?",
+            "Ich lerne seit drei Monaten Deutsch.",
+        ]
+        sentence = st.selectbox("Target sentence", practice_sentences)
+        st.markdown(f"### 🗣️ Say: *{sentence}*")
+
+        audio = st.audio_input("Record yourself")
+        if audio is not None and st.button("Analyze Pronunciation", type="primary"):
+            with st.spinner("Analyzing..."):
+                try:
+                    result = gt.assess_pronunciation(gemini_key, sentence, audio.getvalue(), audio.type or "audio/wav")
+                except Exception as e:
+                    st.error(f"AI error: {e}")
+                    result = None
+
+            if result:
+                score = result.get("overall_score", 0)
+                card_start()
+                st.markdown(f"## Score: {score}%")
+                st.progress(min(1.0, score / 100))
+                if result.get("word_scores"):
+                    st.markdown("**Word-by-word:**")
+                    for ws in result["word_scores"]:
+                        icon = "✅" if ws.get("correct") else "⚠️"
+                        st.markdown(f"{icon} {ws['word']} — {ws.get('note','')}")
+                if result.get("problem_sounds"):
+                    st.caption(f"Sounds to work on: {', '.join(result['problem_sounds'])}")
+                st.write(result.get("fluency_note", ""))
+                st.success(result.get("encouragement", "Keep practicing!"))
+                card_end()
+                xp_earned = max(5, score // 5)
+                db.add_xp(xp_earned, "pronunciation")
+                if score >= 90:
+                    confetti_burst(100)
+
+
+# ----------------------------------------------------------------------------
+# PAGE: CEFR Roadmap
+# ----------------------------------------------------------------------------
+elif page == "🗺️ CEFR Roadmap":
+    st.markdown("## 🗺️ CEFR Roadmap")
+    st.caption("Your progress across the standard European proficiency scale.")
+
+    quiz_df = db.get_quiz_results()
+    vocab_df = db.get_vocab_df()
+    story_progress = db.get_story_progress()
+
+    cefr_defs = [
+        ("A1", 1, 3), ("A2", 3, 10), ("B1", 10, 20), ("B2", 20, 40), ("C1", 40, 50),
+    ]
+    for cefr, lvl_lo, lvl_hi in cefr_defs:
+        level_stories = [s for s in stories.STORIES if s["level"] == cefr] if cefr in ("A1", "A2", "B1", "B2") else []
+        completed_stories = sum(1 for s in level_stories if story_progress.get(s["id"], {}).get("completed"))
+        story_pct = (completed_stories / len(level_stories)) if level_stories else None
+
+        in_range = stats["level"] >= lvl_lo
+        span = lvl_hi - lvl_lo
+        level_pct = max(0.0, min(1.0, (stats["level"] - lvl_lo) / span)) if span else (1.0 if in_range else 0.0)
+
+        card_start()
+        st.markdown(f"### {cefr} {'✅' if stats['level'] >= lvl_hi else ('🟡' if in_range else '🔒')}")
+        st.markdown(f"Levels {lvl_lo}–{lvl_hi}")
+        xp_bar(level_pct)
+        if story_pct is not None:
+            st.caption(f"Stories: {completed_stories}/{len(level_stories)} completed")
+        card_end()
+
+
+# ----------------------------------------------------------------------------
+# PAGE: Statistics
+# ----------------------------------------------------------------------------
+elif page == "📊 Statistics":
+    st.markdown("## 📊 Statistics Dashboard")
+
+    quiz_df = db.get_quiz_results()
+    xp_log = db.get_xp_log()
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        card_start(); st.metric("Level", stats["level"]); card_end()
+    with c2:
+        card_start(); st.metric("Total XP", f"{stats['xp']:,}"); card_end()
+    with c3:
+        card_start(); st.metric("Words Learned", stats["words_saved"]); card_end()
+    with c4:
+        card_start(); st.metric("Words Mastered", stats["words_mastered"]); card_end()
+
+    if not quiz_df.empty:
+        import plotly.express as px
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("#### Quiz Accuracy by Type")
+            acc = quiz_df.groupby("quiz_type").apply(
+                lambda g: 100 * g["score"].sum() / g["total"].sum() if g["total"].sum() else 0,
+                include_groups=False,
+            ).reset_index(name="accuracy")
+            fig = px.bar(acc, x="quiz_type", y="accuracy", range_y=[0, 100])
+            fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig, width='stretch')
+            weakest = acc.loc[acc["accuracy"].idxmin(), "quiz_type"] if len(acc) else "—"
+            strongest = acc.loc[acc["accuracy"].idxmax(), "quiz_type"] if len(acc) else "—"
+            st.caption(f"Strongest: **{strongest}** · Weakest: **{weakest}**")
+        with c2:
+            st.markdown("#### Average Quiz Score")
+            avg_score = 100 * quiz_df["score"].sum() / quiz_df["total"].sum() if quiz_df["total"].sum() else 0
+            st.metric("Average", f"{avg_score:.1f}%")
+            st.markdown("#### Quizzes Over Time")
+            by_date = quiz_df.groupby("date").size().reset_index(name="count")
+            fig2 = px.line(by_date, x="date", y="count")
+            fig2.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig2, width='stretch')
+    else:
+        st.info("Complete some quizzes to see your statistics here.")
+
+    if not xp_log.empty:
+        import plotly.express as px
+        st.markdown("#### XP Sources")
+        by_source = xp_log.groupby("source")["amount"].sum().reset_index().sort_values("amount", ascending=False)
+        fig3 = px.pie(by_source, names="source", values="amount", hole=0.5)
+        fig3.update_layout(paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig3, width='stretch')
+
+        st.markdown("#### Study Calendar Heatmap (XP earned per day)")
+        daily = xp_log.groupby("date")["amount"].sum().reset_index()
+        daily["date"] = pd.to_datetime(daily["date"])
+        daily["weekday"] = daily["date"].dt.day_name()
+        daily["week"] = daily["date"].dt.isocalendar().week
+        order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        pivot = daily.pivot_table(index="weekday", columns="week", values="amount", aggfunc="sum").reindex(order)
+        fig4 = px.imshow(pivot, aspect="auto", labels=dict(color="XP"))
+        fig4.update_layout(paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig4, width='stretch')
+
+
+# ----------------------------------------------------------------------------
+# PAGE: Weekly Challenges
+# ----------------------------------------------------------------------------
+elif page == "🎯 Weekly Challenges":
+    st.markdown("## 🎯 Weekly Challenges")
+    week_start = (dt.date.today() - dt.timedelta(days=dt.date.today().weekday())).isoformat()
+    challenges = rewards.challenges_for_week(week_start)
+    db.ensure_weekly_challenges(week_start, [{"key": c["key"], "target": c["target"]} for c in challenges])
+    saved = {c["challenge_key"]: c for c in db.get_weekly_challenges(week_start)}
+
+    st.caption(f"Week of {week_start} — new challenges every Monday.")
+
+    for c in challenges:
+        s = saved.get(c["key"], {})
+        progress = s.get("progress", 0)
+        completed = s.get("completed", 0)
+        reward_claimed = s.get("reward_claimed", 0)
+        pct = min(1.0, progress / c["target"]) if c["target"] else 0
+
+        card_start()
+        st.markdown(f"### {'✅' if completed else '🎯'} {c['label']}")
+        st.progress(pct)
+        st.caption(f"{progress:.0f} / {c['target']} {c['unit']}")
+        st.markdown(f"Reward: **+{c['reward_xp']} XP**, **+{c['reward_coins']} 🪙**")
+        if completed and not reward_claimed:
+            if st.button("Claim Reward", key=f"claim_{c['key']}", type="primary"):
+                db.add_xp(c["reward_xp"], "weekly_challenge")
+                db.add_coins(c["reward_coins"])
+                db.claim_weekly_reward(week_start, c["key"])
+                confetti_burst(150)
+                st.rerun()
+        elif reward_claimed:
+            st.success("Reward claimed!")
+        card_end()
+
+
+# ----------------------------------------------------------------------------
+# PAGE: Shop
+# ----------------------------------------------------------------------------
+elif page == "🛍️ Shop":
+    st.markdown("## 🛍️ Shop")
+    st.markdown(f"🪙 Balance: **{stats['coins']:,}**")
+    st.caption("Coins never buy learning shortcuts — only cosmetics and fun extras.")
+
+    tab1, tab2, tab3, tab4 = st.tabs(["⭐ Daily Shop", "🏬 Full Catalog", "🔑 Keys", "🎁 Seasonal Shop"])
+
+    with tab1:
+        st.caption("Refreshes every 24 hours. Rare chance (2%) for a discounted legendary item!")
+        daily_items = _get_daily_shop()
+        owned = db.owned_item_ids()
+        cols = st.columns(5)
+        for i, entry in enumerate(daily_items):
+            item = sc.get_item(entry["id"])
+            if not item:
+                continue
+            discounted_price = int(item["price"] * (1 - entry["discount_pct"] / 100))
+            with cols[i % 5]:
+                card_start()
+                is_special = entry.get("is_legendary_special")
+                st.markdown(f"{'🌟 ' if is_special else ''}{item['emoji']} **{item['name']}**")
+                st.caption(f"{item['rarity'].title()} · -{entry['discount_pct']}%")
+                st.markdown(f"~~{item['price']}~~ **{discounted_price}** 🪙")
+                if item["id"] in owned:
+                    st.caption("Owned ✅")
+                elif st.button("Buy", key=f"buy_daily_{item['id']}", width='stretch'):
+                    _buy_item(item["id"], discounted_price, profile.get("sound_enabled", "1") == "1")
+                card_end()
+
+    with tab2:
+        type_filter = st.selectbox("Category", ["All"] + sorted({i["type"] for i in sc.PURCHASABLE_ITEMS}))
+        rarity_filter = st.selectbox("Rarity", ["All", "common", "uncommon", "rare", "legendary"])
+        items = sc.PURCHASABLE_ITEMS
+        if type_filter != "All":
+            items = [i for i in items if i["type"] == type_filter]
+        if rarity_filter != "All":
+            items = [i for i in items if i["rarity"] == rarity_filter]
+
+        owned = db.owned_item_ids()
+        cols = st.columns(4)
+        for i, item in enumerate(items):
+            with cols[i % 4]:
+                card_start()
+                st.markdown(f"{item['emoji']} **{item['name']}**")
+                st.markdown(rarity_span(item["rarity"], item["rarity"].title()), unsafe_allow_html=True)
+                st.markdown(f"**{item['price']}** 🪙")
+                if item["id"] in owned:
+                    st.caption("Owned ✅")
+                elif st.button("Buy", key=f"buy_cat_{item['id']}", width='stretch'):
+                    _buy_item(item["id"], item["price"], profile.get("sound_enabled", "1") == "1")
+                card_end()
+
+    with tab3:
+        st.caption("Keys open Loot Chests in the Loot Chests page.")
+        cols = st.columns(4)
+        for i, (key_type, price) in enumerate(sc.KEY_PRICES.items()):
+            with cols[i]:
+                card_start()
+                st.markdown(f"🔑 **{key_type.title()} Key**")
+                st.markdown(f"You have: {profile.get(f'{key_type}_keys','0')}")
+                st.markdown(f"**{price}** 🪙")
+                if st.button("Buy Key", key=f"buy_key_{key_type}", width='stretch'):
+                    if db.spend_coins(price):
+                        db.add_keys(key_type, 1)
+                        play_sound("coin", profile.get("sound_enabled", "1") == "1")
+                        st.rerun()
+                    else:
+                        st.error("Not enough coins!")
+                card_end()
+
+    with tab4:
+        active_now = sc.seasonal_items_active()
+        st.caption("Seasonal items are always purchasable in the Full Catalog tab too — "
+                   "this tab just highlights what's 'in season' right now.")
+        owned = db.owned_item_ids()
+        if not active_now:
+            st.info("Nothing is in season right now. Check back later, or grab any seasonal "
+                    "theme early from the Full Catalog tab.")
+        else:
+            cols = st.columns(len(active_now))
+            for i, item in enumerate(active_now):
+                with cols[i]:
+                    card_start()
+                    st.markdown(f"{item['emoji']} **{item['name']}**")
+                    st.markdown(rarity_span(item["rarity"], item["rarity"].title()), unsafe_allow_html=True)
+                    st.markdown(f"**{item['price']}** 🪙")
+                    if item["id"] in owned:
+                        st.caption("Owned ✅")
+                    elif st.button("Buy", key=f"buy_seasonal_{item['id']}", width='stretch'):
+                        _buy_item(item["id"], item["price"], profile.get("sound_enabled", "1") == "1")
+                    card_end()
+
+        st.markdown("#### All Seasonal Themes")
+        for item in sc.seasonal_items_all():
+            in_season = item in active_now
+            st.markdown(f"{'🟢' if in_season else '⚪'} {item['emoji']} {item['name']} "
+                        f"{'(in season now)' if in_season else ''}")
+
+
+# ----------------------------------------------------------------------------
+# PAGE: Loot Chests
+# ----------------------------------------------------------------------------
+elif page == "📦 Loot Chests":
+    st.markdown("## 📦 Loot Chests")
+    st.caption("Open chests with keys for a chance at cosmetics, pets, and exclusive chest-only items.")
+
+    chest_info = {
+        "common": ("📦", "Common: 75% Common · 15% Uncommon · 10% Rare"),
+        "uncommon": ("🎁", "Uncommon: 15% Common · 65% Uncommon · 15% Rare · 5% Legendary"),
+        "rare": ("💎", "Rare: 5% Common · 25% Uncommon · 60% Rare · 10% Legendary"),
+        "legendary": ("🌟", "Legendary: 25% Rare · 75% Legendary"),
+    }
+
+    cols = st.columns(4)
+    for i, (chest_type, (emoji, odds_label)) in enumerate(chest_info.items()):
+        with cols[i]:
             card_start()
-            c1, c2 = st.columns([4, 1])
-            with c1:
-                st.markdown(f"#### {row['title']}")
-                st.caption(f"Type: {row['item_type']}")
-                if row["notes"]:
-                    st.write(row["notes"])
-            with c2:
-                if row["url"]:
-                    st.link_button("Open ↗", row["url"], width='stretch')
-                if st.button("Remove", key=f"remove_fav_{row['id']}"):
-                    db.delete_favorite(int(row["id"]))
+            st.markdown(f"### {emoji} {chest_type.title()}")
+            st.caption(odds_label)
+            keys_owned = int(float(profile.get(f"{chest_type}_keys", "0") or 0))
+            st.markdown(f"🔑 Keys: **{keys_owned}**")
+            if keys_owned >= 1:
+                if st.button(f"Open {chest_type.title()} Chest", key=f"open_{chest_type}"):
+                    st.session_state["opening_chest"] = chest_type
                     st.rerun()
+            else:
+                st.caption("No keys — buy some in the Shop!")
             card_end()
 
+    if st.session_state.get("opening_chest"):
+        chest_type = st.session_state["opening_chest"]
+        db.spend_key(chest_type)
+        won_item = loot.open_chest(chest_type)
 
-# ----------------------------------------------------------------------------
-# PAGE: Search
-# ----------------------------------------------------------------------------
-elif page == "🔎 Search":
-    st.markdown("## 🔎 Search Everything")
-    st.caption("Fuzzy search across saved words, notes, favorites, achievements, sessions, and challenges.")
+        st.markdown("### 🎰 ...")
+        spin_html = f"""
+        <div style="text-align:center; padding:2rem;">
+            <div id="spin" style="font-size:4rem; transition: transform 2s cubic-bezier(.2,.8,.2,1);">
+                🎁🎁🎁🎁🎁
+            </div>
+        </div>
+        <script>
+        setTimeout(function() {{
+            const el = document.getElementById('spin');
+            if (el) {{
+                el.style.transform = 'rotate(1080deg) scale(1.3)';
+                el.innerText = '{won_item["emoji"]}';
+            }}
+        }}, 100);
+        </script>
+        """
+        st.components.v1.html(spin_html, height=150)
 
-    query = st.text_input("Search", placeholder="Type to search...")
+        card_start()
+        st.markdown(f"## You won: {won_item['emoji']} {won_item['name']}!")
+        st.markdown(rarity_span(won_item["rarity"], won_item["rarity"].upper()), unsafe_allow_html=True)
+        card_end()
+        confetti_burst(200 if won_item["rarity"] == "legendary" else 100)
+        play_sound("unlock", profile.get("sound_enabled", "1") == "1")
 
-    def fuzzy_match(needle: str, haystack: str) -> bool:
-        if not needle:
-            return False
-        n, h = needle.lower(), (haystack or "").lower()
-        if n in h:
-            return True
-        # simple subsequence fuzzy match for typo tolerance
-        it = iter(h)
-        return all(ch in it for ch in n)
-
-    if query:
-        results_found = False
-
-        words_df = db.get_saved_words()
-        word_hits = words_df[words_df.apply(
-            lambda r: fuzzy_match(query, str(r["word"])) or fuzzy_match(query, str(r["meaning"])), axis=1
-        )] if not words_df.empty else words_df
-        if not word_hits.empty:
-            results_found = True
-            st.markdown(f"### 📚 Saved Words ({len(word_hits)})")
-            st.dataframe(word_hits[["word", "meaning", "collection"]], width='stretch', hide_index=True)
-
-        notes_df = db.get_notes()
-        note_hits = notes_df[notes_df["content"].apply(lambda c: fuzzy_match(query, c))] if not notes_df.empty else notes_df
-        if not note_hits.empty:
-            results_found = True
-            st.markdown(f"### 📝 Notes ({len(note_hits)})")
-            st.dataframe(note_hits[["date", "content"]], width='stretch', hide_index=True)
-
-        favs_df = db.get_favorites()
-        fav_hits = favs_df[favs_df["title"].apply(lambda t: fuzzy_match(query, t))] if not favs_df.empty else favs_df
-        if not fav_hits.empty:
-            results_found = True
-            st.markdown(f"### ⭐ Favorites ({len(fav_hits)})")
-            st.dataframe(fav_hits[["title", "item_type", "url"]], width='stretch', hide_index=True)
-
-        ach_hits = [a for a in achievement_definitions()
-                    if fuzzy_match(query, a["name"]) or fuzzy_match(query, a["desc"])]
-        if ach_hits:
-            results_found = True
-            st.markdown(f"### 🏆 Achievements ({len(ach_hits)})")
-            for a in ach_hits:
-                st.markdown(f"- {a['emoji']} **{a['name']}** — {a['desc']}")
-
-        sessions_df = db.get_all_sessions()
-        session_hits = sessions_df[sessions_df.apply(
-            lambda r: fuzzy_match(query, str(r["category"])) or fuzzy_match(query, str(r["resource"]))
-            or fuzzy_match(query, str(r["notes"])), axis=1
-        )] if not sessions_df.empty else sessions_df
-        if not session_hits.empty:
-            results_found = True
-            st.markdown(f"### ⏱️ Sessions ({len(session_hits)})")
-            show = session_hits[["date", "category", "minutes", "resource", "notes"]].head(20).copy()
-            show["date"] = show["date"].dt.strftime("%Y-%m-%d")
-            st.dataframe(show, width='stretch', hide_index=True)
-
-        challenge_hits = [c for c in CHALLENGE_TITLES_FLAT if fuzzy_match(query, c)]
-        if challenge_hits:
-            results_found = True
-            st.markdown(f"### 🎯 Challenge Types ({len(challenge_hits)})")
-            for c in challenge_hits:
-                st.markdown(f"- {c}")
-
-        if not results_found:
-            st.warning("No matches found.")
-    else:
-        st.caption("Start typing above to search across your entire learning history.")
+        if st.button("Awesome!"):
+            del st.session_state["opening_chest"]
+            st.rerun()
 
 
 # ----------------------------------------------------------------------------
-# PAGE: Calendar
+# PAGE: Avatar Customization
 # ----------------------------------------------------------------------------
-elif page == "📅 Calendar":
-    st.markdown("## 📅 Calendar View")
-    st.caption("Click a date below to see everything that happened that day.")
+elif page == "🧑‍🎨 Avatar":
+    st.markdown("## 🧑‍🎨 Avatar Customization")
+    st.caption("Equip cosmetics you've earned through learning, shopping, or loot chests. Everything shown here is unlocked, not just bought — nothing here affects learning power.")
 
-    df = db.get_all_sessions()
-    if df.empty:
-        st.info("Log some sessions to populate your calendar.")
-    else:
-        month_options = sorted(df["date"].dt.to_period("M").unique(), reverse=True)
-        month_labels = [str(m) for m in month_options]
-        chosen_month = st.selectbox("Month", month_labels)
-        month_df = df[df["date"].dt.to_period("M").astype(str) == chosen_month]
+    owned = db.owned_item_ids()
 
-        by_day = month_df.groupby(month_df["date"].dt.date)["hours"].sum()
-        achievements_df_dates = set()  # achievements have no per-day date column; skipped intentionally
+    slots = [
+        ("Theme", "theme", "equipped_theme"),
+        ("Pet", "pet", "equipped_pet"),
+        ("Hair", "avatar_hair", "equipped_avatar_hair"),
+        ("Clothes", "avatar_clothes", "equipped_avatar_clothes"),
+        ("Background", "avatar_bg", "equipped_avatar_bg"),
+        ("Frame", "avatar_frame", "equipped_avatar_frame"),
+        ("Title", "title", "equipped_title"),
+        ("XP Effect", "xp_effect", "equipped_xp_effect"),
+    ]
 
-        import calendar as cal
-        year, mo = map(int, chosen_month.split("-"))
-        st.markdown(f"### {cal.month_name[mo]} {year}")
-        weeks = cal.monthcalendar(year, mo)
-        header_cols = st.columns(7)
-        for i, d in enumerate(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]):
-            header_cols[i].markdown(f"**{d}**")
-        for week in weeks:
-            cols = st.columns(7)
-            for i, day_num in enumerate(week):
-                with cols[i]:
-                    if day_num == 0:
-                        st.write("")
-                    else:
-                        the_date = dt.date(year, mo, day_num)
-                        hrs = by_day.get(the_date, 0.0)
-                        marker = "🟩" if hrs > 0 else "⬜"
-                        st.markdown(f"{marker} **{day_num}**")
-                        if hrs > 0:
-                            st.caption(f"{hrs:.1f}h")
+    preview_col, slots_col = st.columns([1, 2])
+    with preview_col:
+        card_start()
+        st.markdown("#### Preview")
+        pet_emoji = equipped_pet_emoji(profile)
+        bg_item = sc.get_item(profile.get("equipped_avatar_bg", ""))
+        st.markdown(f"<div style='font-size:1.2rem;'>{bg_item['emoji'] if bg_item else '🖼️'} "
+                    f"{'👤'} {pet_emoji or ''}</div>", unsafe_allow_html=True)
+        title_item = sc.get_item(profile.get("equipped_title", ""))
+        if title_item:
+            st.caption(f"Title: {title_item['name']}")
+        card_end()
 
-        st.markdown("### Day Detail")
-        picked = st.date_input("Pick a date to inspect", value=dt.date.today())
-        day_sessions = df[df["date"] == pd.Timestamp(picked)]
-        if day_sessions.empty:
-            st.caption("No sessions logged on this date.")
-        else:
-            show = day_sessions[["category", "minutes", "difficulty", "resource", "notes"]]
-            st.dataframe(show, width='stretch', hide_index=True)
+    with slots_col:
+        for label, item_type, profile_key in slots:
+            owned_of_type = [sc.get_item(i) for i in owned if sc.get_item(i) and sc.get_item(i)["type"] == item_type]
+            if not owned_of_type:
+                st.caption(f"**{label}:** nothing owned yet.")
+                continue
+
+            # Build option *strings* directly (no format_func) — using format_func here
+            # caused a widget-state reconstruction error when navigating away from this
+            # page with a selection made, so labels are the actual option values and we
+            # map back to the item id afterward.
+            none_label = "(None)"
+            label_to_id = {f"{i['emoji']} {i['name']}": i["id"] for i in owned_of_type}
+            id_to_label = {v: k for k, v in label_to_id.items()}
+            options = [none_label] + list(label_to_id.keys())
+
+            current_id = profile.get(profile_key, "") or ""
+            current_label = id_to_label.get(current_id, none_label)
+            if current_label not in options:
+                current_label = none_label
+
+            choice_label = st.selectbox(label, options, index=options.index(current_label),
+                                         key=f"equip_{profile_key}")
+            if choice_label != current_label:
+                new_id = "" if choice_label == none_label else label_to_id[choice_label]
+                db.set_profile(profile_key, new_id)
+                st.rerun()
 
 
 # ----------------------------------------------------------------------------
-# PAGE: Achievements
+# PAGE: Trophy Room
 # ----------------------------------------------------------------------------
-elif page == "🏆 Achievements":
-    st.markdown("## 🏆 Achievements")
+elif page == "🏆 Trophy Room":
+    st.markdown("## 🏆 Trophy Room")
+    st.caption("Achievements, badges, and rare collectibles you've earned.")
+
     unlocked_keys = db.get_unlocked_achievements()
-    defs = achievement_definitions()
+    defs = ach.achievement_definitions()
     unlocked_count = sum(1 for d in defs if d["key"] in unlocked_keys)
-    st.progress(unlocked_count / len(defs))
-    st.caption(f"{unlocked_count} / {len(defs)} unlocked")
+    st.progress(unlocked_count / len(defs) if defs else 0)
+    st.caption(f"{unlocked_count} / {len(defs)} achievements unlocked")
 
     badge_html = "<div style='display:flex;flex-wrap:wrap;'>"
     for a in defs:
         locked_cls = "" if a["key"] in unlocked_keys else "locked"
         badge_html += f"""
-        <div class="ff-badge {locked_cls}" title="{a['desc']}">
+        <div class="rpg-badge {locked_cls}" title="{a['desc']}">
             <div class="emoji">{a['emoji']}</div>
             <div class="name">{a['name']}</div>
         </div>"""
@@ -1003,85 +1288,18 @@ elif page == "🏆 Achievements":
     st.markdown("### Details")
     for a in defs:
         status = "✅" if a["key"] in unlocked_keys else "🔒"
-        st.markdown(f"{status} **{a['name']}** — {a['desc']}")
+        st.markdown(f"{status} {rarity_span(a['rarity'], a['rarity'].title())} **{a['name']}** — {a['desc']}",
+                    unsafe_allow_html=True)
 
-    st.markdown("### Milestones")
-    milestone_cols = st.columns(4)
-    for i, m in enumerate(db.MILESTONES_HOURS):
-        reached = totals["total_hours"] >= m
-        with milestone_cols[i % 4]:
-            st.markdown(
-                f"""<div class="ff-card" style="text-align:center;opacity:{1 if reached else 0.4};">
-                <div style="font-size:1.5rem;">{'🏅' if reached else '⚪'}</div>
-                <b>{m}h</b></div>""",
-                unsafe_allow_html=True,
-            )
-
-
-# ----------------------------------------------------------------------------
-# PAGE: Statistics
-# ----------------------------------------------------------------------------
-elif page == "📊 Statistics":
-    st.markdown("## 📊 Statistics")
-    df = db.get_all_sessions()
-    theme = THEMES[profile.get("current_theme", "Neon Megacity")]
-
-    if df.empty:
-        st.info("Log some study sessions to see your statistics here.")
+    st.markdown("### 🎒 Collectibles Inventory")
+    inv = db.get_inventory()
+    if inv.empty:
+        st.info("No items yet — visit the Shop or open a Loot Chest!")
     else:
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.markdown(metric_html("Sessions", len(df)), unsafe_allow_html=True)
-        with c2:
-            st.markdown(metric_html("Avg session", f"{df['minutes'].mean():.0f}", " min"), unsafe_allow_html=True)
-        with c3:
-            fav = df.groupby("category")["minutes"].sum().idxmax()
-            st.markdown(metric_html("Favorite activity", fav), unsafe_allow_html=True)
-        with c4:
-            fav_day = df["date"].dt.day_name().value_counts().idxmax()
-            st.markdown(metric_html("Most productive day", fav_day), unsafe_allow_html=True)
-
-        st.markdown("### Study Calendar Heatmap")
-        daily = df.groupby(df["date"].dt.date)["hours"].sum().reset_index()
-        daily.columns = ["date", "hours"]
-        daily["date"] = pd.to_datetime(daily["date"])
-        daily["week"] = daily["date"].dt.isocalendar().week
-        daily["weekday"] = daily["date"].dt.day_name()
-        order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        pivot = daily.pivot_table(index="weekday", columns="week", values="hours", aggfunc="sum").reindex(order)
-        fig_heat = px.imshow(
-            pivot, color_continuous_scale=[[0, "rgba(255,255,255,0.05)"], [1, theme["accent"]]],
-            aspect="auto", labels=dict(color="Hours"),
-        )
-        fig_heat.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                                font_color=theme["text"], height=320)
-        st.plotly_chart(fig_heat, width='stretch')
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("### Hours by Category")
-            cat = df.groupby("category")["hours"].sum().reset_index().sort_values("hours", ascending=False)
-            fig_pie = px.pie(cat, names="category", values="hours", hole=0.5)
-            fig_pie.update_layout(paper_bgcolor="rgba(0,0,0,0)", font_color=theme["text"], height=350)
-            st.plotly_chart(fig_pie, width='stretch')
-        with col2:
-            st.markdown("### Weekly Trend")
-            weekly = df.set_index("date").resample("W")["hours"].sum().reset_index()
-            fig_line = px.bar(weekly, x="date", y="hours")
-            fig_line.update_traces(marker_color=theme["accent"])
-            fig_line.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                                    font_color=theme["text"], height=350)
-            st.plotly_chart(fig_line, width='stretch')
-
-        st.markdown("### Monthly Trend")
-        monthly = df.set_index("date").resample("ME")["hours"].sum().reset_index()
-        fig_month = px.area(monthly, x="date", y="hours")
-        fig_month.update_traces(line_color=theme["accent2"])
-        fig_month.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                                 font_color=theme["text"], height=320)
-        st.plotly_chart(fig_month, width='stretch')
-
-        st.markdown(f"**Longest streak:** {stats_snapshot['longest_streak']} days")
+        by_type = inv.groupby("item_type").size().sort_values(ascending=False)
+        st.bar_chart(by_type)
+        st.dataframe(inv[["item_id", "item_type", "rarity", "acquired_via", "acquired_at"]],
+                     width='stretch', hide_index=True)
 
 
 # ----------------------------------------------------------------------------
@@ -1090,132 +1308,46 @@ elif page == "📊 Statistics":
 elif page == "⚙️ Settings":
     st.markdown("## ⚙️ Settings")
 
-    st.markdown("### Daily Goal")
-    goal = st.select_slider(
-        "Daily goal", options=[15, 30, 45, 60, 120],
-        value=int(profile.get("daily_goal_minutes", "30") or 30),
-        format_func=lambda m: f"{m} min" if m < 60 else f"{m//60} hr",
-        key="settings_goal_slider",
-    )
-    if goal != int(profile.get("daily_goal_minutes", "30") or 30):
-        db.set_profile("daily_goal_minutes", goal)
-        st.toast("Daily goal saved!")
+    display_name = st.text_input("Display name", value=profile.get("display_name", "Sprachheld"))
+    if display_name != profile.get("display_name"):
+        db.set_profile("display_name", display_name)
+        st.rerun()
 
-    adaptive = intel.adaptive_goal_suggestion()
-    if adaptive:
-        st.info(adaptive[0], icon="🎯")
-
-    st.markdown("---")
-    st.markdown(f"**Streak Freeze tokens:** {profile.get('streak_freeze_tokens','0')} 🧊")
-    st.caption("Earned automatically every 7-day streak. Auto-applied to cover a single missed day.")
-
-    st.markdown("---")
-    st.markdown("### ♿ Accessibility & Customization")
-    st.caption("All changes save instantly and apply across the whole app.")
-
-    ac1, ac2 = st.columns(2)
-    with ac1:
-        font_size = st.select_slider(
-            "Font size", options=["Small", "Medium", "Large", "Extra Large"],
-            value=profile.get("font_size", "Medium"), key="settings_font_size",
-        )
-        layout_density = st.radio(
-            "Layout density", ["Spacious", "Compact"],
-            index=0 if profile.get("layout_density", "Spacious") == "Spacious" else 1,
-            key="settings_density", horizontal=True,
-        )
-    with ac2:
-        high_contrast = st.toggle("High-contrast mode", value=profile.get("high_contrast", "0") == "1", key="settings_hc")
-        reduced_motion = st.toggle("Reduced motion", value=profile.get("reduced_motion", "0") == "1", key="settings_rm")
-        colorblind_mode = st.toggle("Color-blind-friendly palette", value=profile.get("colorblind_mode", "0") == "1", key="settings_cb")
-
-    changed = False
-    if font_size != profile.get("font_size", "Medium"):
-        db.set_profile("font_size", font_size); changed = True
-    if layout_density != profile.get("layout_density", "Spacious"):
-        db.set_profile("layout_density", layout_density); changed = True
-    if str(int(high_contrast)) != profile.get("high_contrast", "0"):
-        db.set_profile("high_contrast", int(high_contrast)); changed = True
-    if str(int(reduced_motion)) != profile.get("reduced_motion", "0"):
-        db.set_profile("reduced_motion", int(reduced_motion)); changed = True
-    if str(int(colorblind_mode)) != profile.get("colorblind_mode", "0"):
-        db.set_profile("colorblind_mode", int(colorblind_mode)); changed = True
-    if changed:
+    sound_on = st.toggle("🔊 Sound effects", value=profile.get("sound_enabled", "1") == "1")
+    if str(int(sound_on)) != profile.get("sound_enabled", "1"):
+        db.set_profile("sound_enabled", int(sound_on))
         st.rerun()
 
     st.markdown("---")
-    st.markdown("### ⌨️ Keyboard Shortcuts")
-    shortcuts_enabled = st.toggle(
-        "Enable keyboard shortcuts (beta)",
-        value=profile.get("keyboard_shortcuts", "0") == "1",
-        key="settings_shortcuts",
-        help="Best-effort: jumps to a page by simulating a click on the sidebar nav. "
-             "May not work in every browser."
-    )
-    if str(int(shortcuts_enabled)) != profile.get("keyboard_shortcuts", "0"):
-        db.set_profile("keyboard_shortcuts", int(shortcuts_enabled))
-        st.rerun()
-
-    with st.expander("Shortcut reference"):
-        st.markdown(
-            "- **D** → Dashboard\n"
-            "- **L** → Log Study Time\n"
-            "- **C** → Daily Challenges\n"
-            "- **F** → Search\n"
-            "- **Esc** → Unfocus the current field\n\n"
-            "Shortcuts are ignored while typing in a text field."
-        )
+    st.markdown(f"🧊 Streak Freeze tokens: **{profile.get('streak_freeze_tokens','0')}** "
+                f"(earned automatically every 7-day streak)")
 
     st.markdown("---")
     st.markdown("### 💾 Data Export & Backup")
-
-    exp1, exp2, exp3 = st.columns(3)
-    with exp1:
-        df_all = db.get_all_sessions()
-        if not df_all.empty:
-            st.download_button(
-                "⬇️ Sessions (CSV)",
-                df_all.to_csv(index=False).encode("utf-8"),
-                file_name="fluent_forest_sessions.csv",
-                mime="text/csv",
-                width='stretch',
-            )
-    with exp2:
-        full_export = db.export_all_data()
-        st.download_button(
-            "⬇️ Full Backup (JSON)",
-            json.dumps(full_export, indent=2, default=str).encode("utf-8"),
-            file_name=f"fluent_forest_backup_{dt.date.today().isoformat()}.json",
-            mime="application/json",
-            width='stretch',
-        )
-    with exp3:
-        if st.button("📄 Generate PDF Report", width='stretch'):
-            pdf_bytes = reports.build_progress_report_pdf(profile)
-            st.session_state["pdf_report_bytes"] = pdf_bytes
-        if "pdf_report_bytes" in st.session_state:
-            st.download_button(
-                "⬇️ Download PDF Report",
-                st.session_state["pdf_report_bytes"],
-                file_name=f"fluent_forest_report_{dt.date.today().isoformat()}.pdf",
-                mime="application/pdf",
-                width='stretch',
-            )
-
-    st.markdown("#### Restore from Backup")
-    st.caption("Import a previously exported JSON backup. 'Merge' keeps your current data and adds anything missing; 'Replace' wipes current data first.")
-    uploaded = st.file_uploader("Upload backup JSON", type=["json"])
-    import_mode = st.radio("Import mode", ["Merge", "Replace"], horizontal=True, key="import_mode")
-    if uploaded is not None:
-        if st.button("Restore Backup", type="primary"):
-            try:
-                data = json.load(uploaded)
-                db.import_all_data(data, mode="merge" if import_mode == "Merge" else "replace")
-                st.success("Backup restored! Reloading...")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Could not restore backup: {e}")
+    full_export = db.export_all_data()
+    st.download_button(
+        "⬇️ Full Backup (JSON)",
+        json.dumps(full_export, indent=2, default=str).encode("utf-8"),
+        file_name=f"fluent_forest_rpg_backup_{dt.date.today().isoformat()}.json",
+        mime="application/json",
+    )
+    st.caption(f"Database file: `{db.DB_PATH.name}` (local SQLite — everything autosaves, "
+               f"no manual Save button anywhere in the app).")
 
     st.markdown("---")
-    st.caption(f"Database file: `{db.DB_PATH.name}` (local SQLite — all your data stays on this machine, "
-               f"and everything above autosaves — there's no manual 'Save' button anywhere in the app).")
+    st.markdown("### ⚠️ Danger Zone")
+    if st.button("Reset ALL progress (cannot be undone)"):
+        st.session_state["confirm_reset"] = True
+    if st.session_state.get("confirm_reset"):
+        st.warning("Are you absolutely sure? This deletes everything.")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Yes, reset everything", type="primary"):
+                import os
+                db.DB_PATH.unlink(missing_ok=True)
+                st.session_state.clear()
+                st.rerun()
+        with c2:
+            if st.button("Cancel"):
+                st.session_state["confirm_reset"] = False
+                st.rerun()
