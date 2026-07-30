@@ -111,6 +111,17 @@ CREATE TABLE IF NOT EXISTS ai_conversations (
     content TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS immersion_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    hours REAL NOT NULL,
+    category TEXT,
+    notes TEXT,
+    xp_earned INTEGER NOT NULL,
+    coins_earned INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 DEFAULT_PROFILE = {
@@ -137,6 +148,8 @@ DEFAULT_PROFILE = {
     "uncommon_keys": "0",
     "rare_keys": "0",
     "legendary_keys": "0",
+    "coin_activity_date": "",
+    "coin_activity_count": "0",
 }
 
 
@@ -539,6 +552,86 @@ def clear_conversation(scenario):
         conn.execute("DELETE FROM ai_conversations WHERE scenario = ?", (scenario,))
 
 
+# -------------------------------------------------------- immersion hours --
+# Conversion rates from logged immersion hours to XP/coins. Kept as module
+# constants (not buried in app.py) so the Wallet/Statistics pages and any
+# future forecast tooling can reference the same numbers.
+IMMERSION_XP_PER_HOUR = 60
+IMMERSION_COINS_PER_HOUR = 15
+
+
+def add_immersion_session(date_str, hours, category, notes):
+    xp_earned = round(hours * IMMERSION_XP_PER_HOUR)
+    coins_earned = round(hours * IMMERSION_COINS_PER_HOUR)
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO immersion_sessions
+               (date, hours, category, notes, xp_earned, coins_earned, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (date_str, hours, category, notes, xp_earned, coins_earned,
+             dt.datetime.now().isoformat()),
+        )
+    add_xp(xp_earned, "immersion_hours")
+    add_coins(coins_earned)
+    return xp_earned, coins_earned
+
+
+def get_immersion_sessions():
+    import pandas as pd
+    with get_conn() as conn:
+        df = pd.read_sql_query(
+            "SELECT * FROM immersion_sessions ORDER BY date DESC, id DESC", conn
+        )
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+def immersion_totals():
+    df = get_immersion_sessions()
+    if df.empty:
+        return {"total_hours": 0.0, "week_hours": 0.0, "month_hours": 0.0, "sessions": 0}
+    import pandas as pd
+    today = dt.date.today()
+    week_start = pd.Timestamp(today - dt.timedelta(days=today.weekday()))
+    month_start = pd.Timestamp(today.replace(day=1))
+    return {
+        "total_hours": round(float(df["hours"].sum()), 2),
+        "week_hours": round(float(df[df["date"] >= week_start]["hours"].sum()), 2),
+        "month_hours": round(float(df[df["date"] >= month_start]["hours"].sum()), 2),
+        "sessions": len(df),
+    }
+
+
+# -------------------------------------------------------------- wallet ----
+def get_recent_purchases(limit=15):
+    """Items acquired via the shop or a loot chest (i.e. actual 'purchases' in
+    the coins-economy sense — starter/daily-reward/achievement grants excluded)."""
+    import pandas as pd
+    with get_conn() as conn:
+        return pd.read_sql_query(
+            "SELECT * FROM inventory WHERE acquired_via IN ('shop','chest') "
+            "ORDER BY acquired_at DESC LIMIT ?",
+            conn, params=(limit,),
+        )
+
+
+def coin_activity_plays_today() -> int:
+    profile = get_profile()
+    today_str = dt.date.today().isoformat()
+    if profile.get("coin_activity_date") != today_str:
+        return 0
+    return int(float(profile.get("coin_activity_count", "0") or 0))
+
+
+def register_coin_activity_play():
+    today_str = dt.date.today().isoformat()
+    profile = get_profile()
+    count = coin_activity_plays_today()
+    set_profile("coin_activity_date", today_str)
+    set_profile("coin_activity_count", count + 1)
+
+
 # ---------------------------------------------------------------- export --
 def export_all_data() -> dict:
     with get_conn() as conn:
@@ -556,4 +649,5 @@ def export_all_data() -> dict:
             "weekly_challenges": rows("weekly_challenges"),
             "xp_log": rows("xp_log"),
             "chest_openings": rows("chest_openings"),
+            "immersion_sessions": rows("immersion_sessions"),
         }
