@@ -1,183 +1,124 @@
-"""CSS injection for the premium, theme-aware look and feel."""
+"""CSS injection for Fluent Forest RPG — theme-driven via the shop_catalog CSS
+dicts, with card styles, progress bars, animated XP pills, and confetti support."""
 
 import streamlit as st
-from content import THEMES
+import shop_catalog as sc
 
 
-def inject_css(theme_name: str, font_size: str = "Medium", high_contrast: bool = False,
-                reduced_motion: bool = False, colorblind_mode: bool = False,
-                layout_density: str = "Spacious"):
-    theme = dict(THEMES.get(theme_name, THEMES["Neon Megacity"]))
+def inject_css(theme_id: str, reduced_motion: bool = False):
+    item = sc.get_item(theme_id) or sc.get_item("light")
+    css_vars = item["css"]
+    bg = css_vars.get("bg", "linear-gradient(135deg,#f8fafc,#e2e8f0)")
+    text = css_vars.get("text", "#1a1a1a")
+    accent = css_vars.get("accent", "#4f46e5")
+    anim_transition = "none" if reduced_motion else "all .2s ease"
 
-    if colorblind_mode:
-        # Okabe-Ito palette accents — safe for the common forms of color blindness.
-        theme["accent"] = "#0072B2"
-        theme["accent2"] = "#E69F00"
-
-    if high_contrast:
-        theme["text"] = "#ffffff"
-        theme["gradient"] = "linear-gradient(135deg,#000000 0%,#0a0a0a 100%)"
-
-    font_scale = {"Small": "0.9", "Medium": "1.0", "Large": "1.15", "Extra Large": "1.3"}.get(font_size, "1.0")
-    card_padding = "0.9rem 1.1rem" if layout_density == "Compact" else "1.3rem 1.5rem"
-    anim = "none" if reduced_motion else None
-    css = f"""
+    st.markdown(f"""
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Fraunces:ital,wght@0,500;0,700;1,500&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;700;800&family=Nunito:wght@400;600;700;800&display=swap');
 
     html, body, [class*="css"] {{
-        font-family: 'Manrope', -apple-system, BlinkMacSystemFont, sans-serif;
-        font-size: calc(1rem * {font_scale});
+        font-family: 'Nunito', -apple-system, sans-serif;
     }}
-
     .stApp {{
-        background: {theme['gradient']};
+        background: {bg};
         background-attachment: fixed;
-        color: {theme['text']};
+        color: {text};
     }}
-
-    /* Sidebar */
     section[data-testid="stSidebar"] {{
-        background: rgba(0,0,0,0.28);
-        backdrop-filter: blur(18px);
-        border-right: 1px solid rgba(255,255,255,0.08);
+        background: rgba(0,0,0,0.22);
+        backdrop-filter: blur(16px);
     }}
-    section[data-testid="stSidebar"] * {{
-        color: {theme['text']} !important;
-    }}
+    section[data-testid="stSidebar"] * {{ color: {text} !important; }}
 
     h1, h2, h3, h4 {{
-        font-family: 'Fraunces', Georgia, serif;
-        color: {theme['text']};
-        letter-spacing: -0.01em;
+        font-family: 'Baloo 2', cursive;
+        color: {text};
     }}
 
-    /* Glass cards */
-    .ff-card {{
-        background: rgba(255,255,255,0.08);
-        backdrop-filter: blur(16px);
-        -webkit-backdrop-filter: blur(16px);
-        border: 1px solid rgba(255,255,255,0.14);
-        border-radius: 20px;
-        padding: {card_padding};
-        margin-bottom: 1rem;
-        box-shadow: 0 8px 32px rgba(0,0,0,0.25);
-        transition: {'none' if reduced_motion else 'transform 0.25s ease, box-shadow 0.25s ease'};
-    }}
-    .ff-card:hover {{
-        transform: {'none' if reduced_motion else 'translateY(-3px)'};
-        box-shadow: 0 12px 40px rgba(0,0,0,0.35);
-    }}
-
-    .ff-metric-label {{
-        font-size: 0.78rem;
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-        opacity: 0.7;
-        margin-bottom: 0.15rem;
-    }}
-    .ff-metric-value {{
-        font-family: 'Fraunces', serif;
-        font-size: 2.1rem;
-        font-weight: 700;
-        color: {theme['accent2']};
-        line-height: 1.1;
-    }}
-
-    .ff-pill {{
-        display: inline-block;
-        padding: 0.25rem 0.75rem;
-        border-radius: 999px;
-        background: linear-gradient(90deg, {theme['accent']}, {theme['accent2']});
-        color: #0b0b0f;
-        font-weight: 700;
-        font-size: 0.78rem;
-        margin-right: 0.4rem;
-        margin-bottom: 0.3rem;
-    }}
-
-    .ff-badge {{
-        display: inline-flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        width: 100px;
-        padding: 0.9rem 0.5rem;
+    .rpg-card {{
+        background: rgba(255,255,255,0.10);
+        backdrop-filter: blur(14px);
+        border: 1px solid rgba(255,255,255,0.16);
         border-radius: 18px;
-        background: rgba(255,255,255,0.07);
-        border: 1px solid rgba(255,255,255,0.15);
-        margin: 0.35rem;
-        text-align: center;
-        transition: transform .2s ease;
+        padding: 1.1rem 1.4rem;
+        margin-bottom: 0.9rem;
+        transition: {anim_transition};
     }}
-    .ff-badge:hover {{ transform: scale(1.06); }}
-    .ff-badge.locked {{ opacity: 0.35; filter: grayscale(1); }}
-    .ff-badge .emoji {{ font-size: 1.9rem; margin-bottom: 0.25rem; }}
-    .ff-badge .name {{ font-size: 0.68rem; font-weight: 700; }}
+    .rpg-card:hover {{ transform: {'none' if reduced_motion else 'translateY(-2px)'}; }}
 
-    .ff-hero {{
-        border-radius: 26px;
-        padding: 2.2rem 2rem;
-        background: linear-gradient(120deg, rgba(255,255,255,0.10), rgba(255,255,255,0.02));
-        border: 1px solid rgba(255,255,255,0.14);
-        backdrop-filter: blur(20px);
-        margin-bottom: 1.4rem;
+    .rpg-xp-bar-outer {{
+        width: 100%; height: 22px; border-radius: 999px;
+        background: rgba(255,255,255,0.15); overflow: hidden;
+        border: 1px solid rgba(255,255,255,0.2);
+    }}
+    .rpg-xp-bar-inner {{
+        height: 100%; border-radius: 999px;
+        background: linear-gradient(90deg, {accent}, #ffd166);
+        transition: {'none' if reduced_motion else 'width 0.6s ease'};
     }}
 
-    .ff-quote {{
-        font-family: 'Fraunces', serif;
-        font-style: italic;
-        font-size: 1.15rem;
-        border-left: 3px solid {theme['accent']};
-        padding-left: 1rem;
-        opacity: 0.92;
+    .rpg-pill {{
+        display: inline-block; padding: 0.3rem 0.85rem; border-radius: 999px;
+        background: linear-gradient(90deg, {accent}, #ffd166);
+        color: #0b0b0f; font-weight: 800; font-size: 0.85rem; margin: 0.2rem;
     }}
+
+    .rpg-badge {{
+        display: inline-flex; flex-direction: column; align-items: center;
+        width: 96px; padding: 0.8rem 0.4rem; border-radius: 16px;
+        background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.18);
+        margin: 0.3rem; text-align: center;
+    }}
+    .rpg-badge.locked {{ opacity: 0.32; filter: grayscale(1); }}
+    .rpg-badge .emoji {{ font-size: 1.8rem; }}
+    .rpg-badge .name {{ font-size: 0.65rem; font-weight: 700; }}
+
+    .rarity-common {{ color: #9aa5b1; }}
+    .rarity-uncommon {{ color: #3ecf8e; }}
+    .rarity-rare {{ color: #3e8ef7; }}
+    .rarity-legendary {{ color: #f7b32e; text-shadow: 0 0 8px rgba(247,179,46,0.6); }}
 
     div.stButton > button {{
-        border-radius: 14px;
-        border: 1px solid rgba(255,255,255,0.2);
-        background: linear-gradient(90deg, {theme['accent']}, {theme['accent2']});
-        color: #0b0b0f;
-        font-weight: 700;
-        padding: 0.5rem 1.1rem;
-        transition: {'none' if reduced_motion else 'transform .15s ease'};
+        border-radius: 14px; border: 1px solid rgba(255,255,255,0.25);
+        background: linear-gradient(90deg, {accent}, #ffd166);
+        color: #0b0b0f; font-weight: 800;
+        transition: {'none' if reduced_motion else 'transform .12s ease'};
     }}
-    div.stButton > button:hover {{
-        transform: {'none' if reduced_motion else 'translateY(-2px) scale(1.02)'};
-    }}
+    div.stButton > button:hover {{ transform: {'none' if reduced_motion else 'scale(1.03)'}; }}
 
-    [data-testid="stMetricValue"] {{
-        color: {theme['accent2']};
-        font-family: 'Fraunces', serif;
+    .pet-companion {{
+        font-size: 2.4rem;
+        display: inline-block;
+        animation: {'none' if reduced_motion else 'bob 2.4s ease-in-out infinite'};
     }}
-
-    .streak-flame {{
-        font-size: 2.6rem;
-        animation: {'none' if reduced_motion else 'flicker 1.6s infinite alternate'};
-    }}
-    @keyframes flicker {{
-        0% {{ transform: scale(1) rotate(-2deg); opacity: 0.9; }}
-        100% {{ transform: scale(1.08) rotate(2deg); opacity: 1; }}
+    @keyframes bob {{
+        0%, 100% {{ transform: translateY(0); }}
+        50% {{ transform: translateY(-6px); }}
     }}
 
     hr {{ border-color: rgba(255,255,255,0.15); }}
     </style>
-    """
-    st.markdown(css, unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
 
 
 def card_start():
-    st.markdown('<div class="ff-card">', unsafe_allow_html=True)
+    st.markdown('<div class="rpg-card">', unsafe_allow_html=True)
 
 
 def card_end():
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-def metric_html(label, value, suffix=""):
-    return f"""
-    <div class="ff-card">
-        <div class="ff-metric-label">{label}</div>
-        <div class="ff-metric-value">{value}{suffix}</div>
+def xp_bar(pct: float, label: str = ""):
+    pct_clamped = max(0.0, min(1.0, pct)) * 100
+    st.markdown(f"""
+    <div class="rpg-xp-bar-outer">
+        <div class="rpg-xp-bar-inner" style="width:{pct_clamped}%;"></div>
     </div>
-    """
+    {f'<div style="font-size:0.8rem;opacity:0.8;margin-top:0.2rem;">{label}</div>' if label else ''}
+    """, unsafe_allow_html=True)
+
+
+def rarity_span(rarity: str, text: str) -> str:
+    return f'<span class="rarity-{rarity}">{text}</span>'
