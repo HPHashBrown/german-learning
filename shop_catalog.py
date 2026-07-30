@@ -121,6 +121,13 @@ def get_item(item_id):
 
 PURCHASABLE_ITEMS = [v for v in CATALOG.values() if not v["chest_only"]]
 
+# Items available in the "Full Catalog" shop tab specifically. Rare and
+# Legendary items are deliberately excluded here — they're only obtainable
+# via Loot Chests or a lucky Daily Shop rotation (Daily Shop draws from
+# PURCHASABLE_ITEMS, which does include rares, plus its own 2% legendary
+# roll), so they stay special rather than a guaranteed same-day buy.
+CATALOG_TAB_ITEMS = [v for v in PURCHASABLE_ITEMS if v["rarity"] in ("common", "uncommon")]
+
 # Seasonal availability windows: item_id -> list of month numbers (1-12) when
 # it's featured in the Seasonal Shop tab. Items remain purchasable in the Full
 # Catalog tab year-round (a hard lockout felt more frustrating than fun for a
