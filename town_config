@@ -1,8 +1,5 @@
-
 from dataclasses import dataclass, field
-
-
-# ------------------------------------------------------------- Terrain -----
+ 
 @dataclass(frozen=True)
 class Terrain:
     id: str
@@ -12,8 +9,8 @@ class Terrain:
     # requires 'river'). Not enforced yet — buildings just declare a
     # `preferred_terrain` they get a bonus on, engine ignores it until a
     # future update wants to use it. Present now so no redesign is needed later.
-
-
+ 
+ 
 TERRAIN_TYPES: dict[str, Terrain] = {
     t.id: t for t in [
         Terrain("forest", "Forest", "🌲"),
@@ -28,16 +25,16 @@ TERRAIN_TYPES: dict[str, Terrain] = {
         Terrain("flower_field", "Flower Field", "🌸"),
     ]
 }
-
-
+ 
+ 
 # ------------------------------------------------------------- Buildings ---
 @dataclass(frozen=True)
 class BuildingLevel:
     coin_cost: int
     effect_value: float          # meaning depends on effect_type (see Building)
     min_player_level: int = 1
-
-
+ 
+ 
 @dataclass(frozen=True)
 class Building:
     id: str
@@ -50,28 +47,28 @@ class Building:
     description: str = ""
     preferred_terrain: str = ""  # optional, unused mechanically today (future hook)
     unlock_content_key: str = "" # for cultural buildings; read by app.py to gate content
-
+ 
     @property
     def max_level(self) -> int:
         return len(self.levels)
-
+ 
     def build_cost(self) -> int:
         return self.levels[0].coin_cost
-
+ 
     def upgrade_cost(self, current_level: int) -> int | None:
         """Cost to go from current_level -> current_level+1, or None if maxed."""
         if current_level >= self.max_level:
             return None
         return self.levels[current_level].coin_cost
-
+ 
     def effect_at(self, level: int) -> float:
         """level is 1-indexed (a freshly built level-1 building already has an effect)."""
         if level < 1:
             return 0.0
         idx = min(level, self.max_level) - 1
         return self.levels[idx].effect_value
-
-
+ 
+ 
 # Effect types:
 #   "coin_flat"        — flat coins added to every lesson/immersion reward
 #   "coin_pct"         — percentage bonus applied to the lesson reward
@@ -81,14 +78,14 @@ class Building:
 #   "daily_reward_bonus_pct" — increases daily login reward coin amounts (utility)
 #   "content_unlock"   — cultural buildings; effect_value unused, unlock_content_key matters
 #   "none"             — residential / decorations: no mechanical effect
-
+ 
 BUILDINGS: dict[str, Building] = {}
-
-
+ 
+ 
 def _add_building(b: Building):
     BUILDINGS[b.id] = b
-
-
+ 
+ 
 # Residential — no XP, no coin effect, purely town development.
 _add_building(Building(
     id="house", name="House", category="residential", emoji="🏠", min_player_level=1,
@@ -110,7 +107,7 @@ _add_building(Building(
     levels=tuple(BuildingLevel(coin_cost=c, effect_value=0) for c in [900, 1600, 2600]),
     effect_type="none", description="A whole cluster of homes.",
 ))
-
+ 
 # Commercial — boosts lesson coin rewards. Never passive income.
 _add_building(Building(
     id="bakery", name="Bakery", category="commercial", emoji="🥐", min_player_level=1,
@@ -148,7 +145,7 @@ _add_building(Building(
                  [(2500, 60), (4000, 100)]),
     effect_type="coin_flat", description="+coins per completed lesson.",
 ))
-
+ 
 # Educational — supports learning rewards (still coin-side; XP itself never
 # comes from buildings, only from actually completing lessons/challenges).
 _add_building(Building(
@@ -175,7 +172,7 @@ _add_building(Building(
                  [(1800, 15), (2800, 22)]),
     effect_type="coin_pct", description="+% bonus on lesson coin rewards.",
 ))
-
+ 
 # Cultural — unlock content, not coins.
 _add_building(Building(
     id="museum", name="Museum", category="cultural", emoji="🏛️", min_player_level=15,
@@ -201,7 +198,7 @@ _add_building(Building(
     effect_type="content_unlock", unlock_content_key="advanced_stories",
     description="Unlocks the hardest reading stories.",
 ))
-
+ 
 # Utility — global, non-adjacency bonuses per the brief.
 _add_building(Building(
     id="road", name="Road", category="utility", emoji="🛣️", min_player_level=1,
@@ -232,7 +229,7 @@ _add_building(Building(
                  [(250, 5), (450, 10)]),
     effect_type="storage", description="Increases building capacity (reserved for future use).",
 ))
-
+ 
 # Decorations — cosmetic only, own category so they never affect coin math.
 for _iid, _name, _emoji, _lvl, _cost in [
     ("tree", "Tree", "🌳", 1, 20), ("flower", "Flowers", "🌷", 1, 15),
@@ -245,16 +242,16 @@ for _iid, _name, _emoji, _lvl, _cost in [
         min_player_level=_lvl, levels=(BuildingLevel(coin_cost=_cost, effect_value=0),),
         effect_type="none", description="Purely cosmetic.",
     ))
-
-
+ 
+ 
 def buildings_by_category(category: str):
     return [b for b in BUILDINGS.values() if b.category == category]
-
-
+ 
+ 
 def available_buildings(player_level: int):
     return [b for b in BUILDINGS.values() if b.min_player_level <= player_level]
-
-
+ 
+ 
 # --------------------------------------------------------------- Worlds ----
 @dataclass(frozen=True)
 class World:
@@ -266,8 +263,8 @@ class World:
     terrain_weights: dict[str, float]
     difficulty_offset: int         # shifts the tile-count difficulty tier up (0=none)
     coin_reward_multiplier: float  # world-wide multiplier applied on top of buildings
-
-
+ 
+ 
 WORLDS: dict[str, World] = {
     w.id: w for w in [
         World("german_village", "German Village", "🇩🇪", 0, 7,
@@ -290,17 +287,17 @@ WORLDS: dict[str, World] = {
               difficulty_offset=5, coin_reward_multiplier=2.0),
     ]
 }
-
+ 
 WORLD_ORDER = [w.id for w in sorted(WORLDS.values(), key=lambda w: w.order)]
-
-
+ 
+ 
 def next_world_id(current_world_id: str) -> str | None:
     idx = WORLD_ORDER.index(current_world_id)
     if idx + 1 < len(WORLD_ORDER):
         return WORLD_ORDER[idx + 1]
     return None
-
-
+ 
+ 
 # ----------------------------------------------------- Challenge Tiers -----
 # (claimed_tiles_lower_bound, claimed_tiles_upper_bound_exclusive, tier_name)
 # "claimed" excludes the free starting 3x3 — only tiles unlocked via a
@@ -311,13 +308,13 @@ CHALLENGE_TIERS = [
     (30, 60, "hard"),
 ]
 CHALLENGE_TIER_LATE = "advanced"
-
+ 
 TIER_ORDER = ["easy", "medium", "hard", "advanced"]
-
+ 
 TIER_PASS_THRESHOLD = {"easy": 0.6, "medium": 0.7, "hard": 0.8, "advanced": 0.9}
 TIER_QUESTION_COUNT = {"easy": 5, "medium": 5, "hard": 5, "advanced": 6}
-
-
+ 
+ 
 def tier_for_claimed_count(claimed_count: int, world_difficulty_offset: int = 0) -> str:
     base_tier = CHALLENGE_TIER_LATE
     for lo, hi, name in CHALLENGE_TIERS:
@@ -326,3 +323,4 @@ def tier_for_claimed_count(claimed_count: int, world_difficulty_offset: int = 0)
             break
     idx = min(len(TIER_ORDER) - 1, TIER_ORDER.index(base_tier) + world_difficulty_offset)
     return TIER_ORDER[idx]
+ 
