@@ -118,7 +118,9 @@ def can_upgrade(world_id: str, x: int, y: int, player_level: int) -> tuple[bool,
     tile = tdb.get_tile(world_id, x, y)
     if not tile or not tile["building_id"]:
         return False, "No building here.", None
-    building = cfg.BUILDINGS[tile["building_id"]]
+    building = cfg.BUILDINGS.get(tile["building_id"])
+    if building is None:
+        return False, "Unknown building type (data mismatch) — clear and rebuild this tile.", None
     current_level = tile["building_level"]
     cost = effective_upgrade_cost(world_id, building, current_level)
     if cost is None:
@@ -136,8 +138,9 @@ def upgrade(world_id: str, x: int, y: int, player_level: int) -> tuple[bool, str
     tile = tdb.get_tile(world_id, x, y)
     new_level = tile["building_level"] + 1
     tdb.upgrade_building(world_id, x, y, new_level)
-    building = cfg.BUILDINGS[tile["building_id"]]
-    return True, f"{building.name} upgraded to level {new_level}!", cost
+    building = cfg.BUILDINGS.get(tile["building_id"])
+    building_name = building.name if building else tile["building_id"]
+    return True, f"{building_name} upgraded to level {new_level}!", cost
 
 
 # --------------------------------------------------------- Coin bonuses ----
