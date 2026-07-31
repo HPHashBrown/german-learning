@@ -1,20 +1,4 @@
-"""Reading Mode story content.
 
-Honesty note: the brief asked for "100 short German stories." Writing 100
-original stories at real quality (correct grammar, sensible vocab lists,
-working comprehension questions) isn't something that can be done reliably
-in one pass — so this ships with a smaller, carefully-written set (16
-stories, 4 per CEFR level) instead of padding to 100 with weak filler.
-The data structure below is intentionally flat and simple so appending more
-stories later is a copy-paste-and-edit job, not a code change.
-
-Every story is original text written for this app (not sourced from
-anywhere), to avoid any copyright concerns.
-
-"vocab" only lists the specific words that are clickable in the reader (full
-free-text word lookup for arbitrary German would need a real dictionary API,
-which is out of scope) — this is disclosed in the Reading Mode page itself.
-"""
 
 STORIES = [
     # ---------------------------------------------------------------- A1 --
