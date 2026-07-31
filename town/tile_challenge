@@ -1,0 +1,90 @@
+"""Tile-claiming challenges for the Town system.
+
+Deliberately reuses the existing lesson content generators (lessons.py,
+grammar.py) rather than inventing a parallel question bank — this keeps
+"learning is the only way to earn XP/unlock things" literally true, since a
+tile challenge *is* a normal vocabulary/article/verb/grammar question, just
+presented in a different context.
+"""
+
+import random
+
+import grammar
+import lessons
+import town_config as cfg
+
+
+def generate_challenge(tier: str, player_level: int, rng: random.Random = None) -> dict:
+    """Returns {'tier': str, 'pass_threshold': float, 'questions': [...]}.
+    Each question dict has: 'kind' ('mc' for multiple choice), 'prompt',
+    'options', 'correct'."""
+    rng = rng or random.Random()
+    n = cfg.TIER_QUESTION_COUNT[tier]
+    questions = []
+
+    if tier == "easy":
+        categories = lessons.available_categories(max(player_level, 1))
+        basic = [c for c in categories if c in ("Greetings", "Numbers", "Colors", "Basic Vocabulary")] or categories
+        for _ in range(n):
+            cat = rng.choice(basic)
+            q = lessons.make_quiz(cat, 1, rng)[0]
+            questions.append({"kind": "mc", "prompt": q["prompt"], "options": q["options"], "correct": q["correct"]})
+
+    elif tier == "medium":
+        for _ in range(n):
+            if rng.random() < 0.5:
+                aq = grammar.make_article_question(rng)
+                questions.append({
+                    "kind": "mc", "prompt": f"___ {aq['noun']}",
+                    "options": aq["options"], "correct": aq["correct"],
+                })
+            else:
+                categories = lessons.available_categories(max(player_level, 2))
+                cat = rng.choice(categories)
+                q = lessons.make_quiz(cat, 1, rng)[0]
+                questions.append({"kind": "mc", "prompt": q["prompt"], "options": q["options"], "correct": q["correct"]})
+
+    elif tier == "hard":
+        for _ in range(n):
+            vq = grammar.make_verb_question("mixed", rng)
+            questions.append({
+                "kind": "text", "prompt": f"{vq['pronoun']} ___ ({vq['verb']})",
+                "correct": vq["correct"],
+            })
+
+    else:  # advanced
+        all_grammar_qs = [
+            (topic, q) for topic, data in grammar.GRAMMAR_TREE.items() for q in data["quiz"]
+        ]
+        for _ in range(n):
+            if all_grammar_qs and rng.random() < 0.6:
+                _, gq = rng.choice(all_grammar_qs)
+                questions.append({"kind": "mc", "prompt": gq["q"], "options": gq["options"], "correct": gq["correct"]})
+            else:
+                vq = grammar.make_verb_question("strong", rng)
+                questions.append({
+                    "kind": "text", "prompt": f"{vq['pronoun']} ___ ({vq['verb']})",
+                    "correct": vq["correct"],
+                })
+
+    return {
+        "tier": tier,
+        "pass_threshold": cfg.TIER_PASS_THRESHOLD[tier],
+        "questions": questions,
+    }
+
+
+def grade_challenge(challenge: dict, answers: list) -> dict:
+    """answers: list of raw answer strings/choices, same order as questions."""
+    total = len(challenge["questions"])
+    correct = 0
+    for q, a in zip(challenge["questions"], answers):
+        if q["kind"] == "text":
+            if a is not None and a.strip().lower() == q["correct"].strip().lower():
+                correct += 1
+        else:
+            if a == q["correct"]:
+                correct += 1
+    pct = correct / total if total else 0
+    passed = pct >= challenge["pass_threshold"]
+    return {"correct": correct, "total": total, "pct": pct, "passed": passed}
