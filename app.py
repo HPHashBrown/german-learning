@@ -601,31 +601,42 @@ elif page == "🏙️ Town":
             tile = tiles_by_pos[(sx, sy)]
             building = tcfg.BUILDINGS.get(tile["building_id"])
             current_level = int(tile["building_level"])
-            st.markdown(f"### {building.emoji} {building.name} — Level {current_level}")
-            st.caption(building.description)
-
-            ok, reason, cost = te.can_upgrade(world_id, sx, sy, stats["level"])
-            if not ok:
-                st.info(reason)
+            if building is None:
+                st.error(
+                    f"This tile has a building ID (`{tile['building_id']}`) that doesn't match "
+                    f"anything in the current building catalog — likely left over from an "
+                    f"earlier version of the game data. You can clear it and rebuild."
+                )
+                if st.button("Clear this tile's building"):
+                    tdb.remove_building(world_id, sx, sy)
+                    st.session_state.pop("town_selected", None)
+                    st.rerun()
             else:
-                next_effect = building.effect_at(current_level + 1)
-                st.markdown(f"Upgrade to Level {current_level + 1} for **{cost} 🪙**")
-                if building.effect_type in ("coin_flat",):
-                    st.caption(f"New effect: +{next_effect:.0f} coins per lesson")
-                elif building.effect_type in ("coin_pct",):
-                    st.caption(f"New effect: +{next_effect:.0f}% lesson coin bonus")
-                if st.button("Upgrade", type="primary"):
-                    if db.spend_coins(cost):
-                        ok2, msg2, _ = te.upgrade(world_id, sx, sy, stats["level"])
-                        if ok2:
-                            st.balloons()
-                            st.success(msg2)
-                            st.rerun()
+                st.markdown(f"### {building.emoji} {building.name} — Level {current_level}")
+                st.caption(building.description)
+
+                ok, reason, cost = te.can_upgrade(world_id, sx, sy, stats["level"])
+                if not ok:
+                    st.info(reason)
+                else:
+                    next_effect = building.effect_at(current_level + 1)
+                    st.markdown(f"Upgrade to Level {current_level + 1} for **{cost} 🪙**")
+                    if building.effect_type in ("coin_flat",):
+                        st.caption(f"New effect: +{next_effect:.0f} coins per lesson")
+                    elif building.effect_type in ("coin_pct",):
+                        st.caption(f"New effect: +{next_effect:.0f}% lesson coin bonus")
+                    if st.button("Upgrade", type="primary"):
+                        if db.spend_coins(cost):
+                            ok2, msg2, _ = te.upgrade(world_id, sx, sy, stats["level"])
+                            if ok2:
+                                st.balloons()
+                                st.success(msg2)
+                                st.rerun()
+                            else:
+                                db.add_coins(cost)
+                                st.error(msg2)
                         else:
-                            db.add_coins(cost)
-                            st.error(msg2)
-                    else:
-                        st.error("Not enough coins!")
+                            st.error("Not enough coins!")
 
 
 # ----------------------------------------------------------------------------
