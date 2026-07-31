@@ -15,7 +15,7 @@ import re
 from google import genai
 from google.genai import types
 
-MODEL = "gemini-3.6-flash"
+MODEL = "gemini-2.5-flash"
 
 SCENARIOS = {
     "Restaurant": "You are a friendly German waiter/waitress at a restaurant in Berlin.",
