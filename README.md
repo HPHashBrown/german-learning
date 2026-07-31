@@ -29,6 +29,37 @@ general engineering approach (SQLite persistence, tested interaction flows).
   capped mini-activity (a quick der/die/das "Word Flip" round, +5 coins per correct answer,
   limited to 5 rounds/day) for a little extra spending money without turning into a way to
   farm the coin economy.
+- **Town Expansion**: a full Clash-of-Clans-style town-building system. A 3×3 starting grid
+  hidden in fog; clicking an orthogonally-adjacent locked tile (no diagonal expansion, per
+  spec) opens a real learning challenge — reusing the existing vocabulary/article/verb/
+  grammar generators, not a separate content bank — scaled through four difficulty tiers
+  (Easy → Medium → Hard → Advanced) based on how many tiles you've claimed. Passing reveals
+  the tile's terrain (10 types) and awards the game's real XP/coins. 30 buildings across
+  Residential/Commercial/Educational/Cultural/Utility/Decoration categories, each with real
+  multi-level upgrade paths, gated by your actual Player Level. Commercial/Educational/
+  Utility buildings modify (never generate) lesson coin rewards — flat bonus, then percent
+  bonus, then the current world's multiplier, applied to every vocabulary quiz, reading
+  story, immersion-hours log, and tile-claim reward, with the exact breakdown shown to the
+  player each time. Six worlds (German Village → Berlin → Vienna → Zurich → European Tour →
+  World Tour), each with a larger grid, its own terrain-weight table, and a harder starting
+  difficulty tier; advancing requires 100% of the current world's grid unlocked. Everything
+  — terrain types, buildings, worlds, difficulty tiers — lives in one data-driven config
+  file (`town_config.py`); adding a new building or world is a dict entry, not an engine
+  change. Built with plain Streamlit widgets only (button grid, forms, selects) — no custom
+  HTML/JS, per the brief's explicit requirement. Persists in the same SQLite database and
+  was verified to survive a full process restart with tile-for-tile identical state.
+
+  Two honest notes on this system: (1) the brief's own worked coin-bonus example (100 base →
+  137 final) doesn't actually resolve under any consistent stacking order I could construct
+  — I tried flat-then-pct-then-world in several combinations and none hit exactly 137, so I
+  treated it as illustrative rather than an exact spec and implemented a clearly-defined,
+  documented, transparently-displayed formula instead (see `compute_coin_bonus` in
+  `town_engine.py`). (2) Cultural buildings (Museum, Opera House, Town Hall, Castle) track
+  which content-unlock keys they've earned (`unlocked_content_keys()` in the engine) but
+  this isn't yet wired into gating actual Reading Stories/AI Chat scenarios — retrofitting a
+  second unlock gate onto already-working, already-tested content pages carried more
+  regression risk than benefit in this pass, so it's a clean, ready-to-use hook rather than
+  a half-integrated feature.
 - **Currency system**: coins, separate from XP, earned from quizzes/stories/challenges,
   spendable only on cosmetics (themes, avatar parts, pets, decorations, XP effects, titles)
   — never on anything that affects learning power.
@@ -136,6 +167,10 @@ Pronunciation Trainer — everything else works with zero API keys.
 - `stories.py` — 16 original reading stories with vocab/grammar/comprehension questions
 - `srs.py` — SM-2 spaced repetition algorithm
 - `daily_extras.py` — idiom / DACH fact / quote of the day
+- `town_config.py` — town system config: terrain, buildings, worlds, challenge tiers (data-driven)
+- `town_db.py` — town system persistence (same SQLite file, its own tables)
+- `town_engine.py` — town system pure game logic (grid, adjacency, building, coin bonuses)
+- `tile_challenge.py` — generates tile-claim challenges by reusing existing quiz/grammar content
 - `gemini_tools.py` — Gemini API integration (chat, writing tutor, pronunciation, dictionary)
 - `achievements.py` — Trophy Room achievement definitions
 - `effects.py` — procedural sound tones + confetti
@@ -161,3 +196,20 @@ work, an edit accidentally deleted a function's `def` line while inserting a new
 above it, orphaning `_generate_daily_shop`'s body and breaking the Shop page — caught
 immediately by re-running the same page-by-page regression test after the change, before
 it reached delivery.
+
+The Town Expansion system added the largest single batch of new code in this project.
+Testing there included: statistical odds-table verification wasn't needed this time, but
+every boundary of the difficulty-tier thresholds (0/10/30/60 tiles) and world difficulty
+offsets was checked directly, all four challenge tiers were verified to generate valid
+questions and grade pass/fail correctly at both extremes and exactly at the pass threshold,
+diagonal-adjacency exclusion and max-level upgrade rejection were both explicitly tested,
+and the full click-through flows (claim a tile with correct answers, claim with wrong
+answers, build, upgrade, complete a world, advance to the next world) were driven through
+actual Streamlit widgets via AppTest, not just called as functions. Two real bugs were
+caught this round: the exact same "accidentally deleted a function's `def` line" mistake
+happened again while wiring in the coin-bonus helper (caught immediately by the same
+regression check, which is now just a standard step after every edit to this file), and a
+dataclass-vs-dict attribute access bug in the tile-claim success message (`reveal['terrain']
+['emoji']` instead of `reveal['terrain'].emoji`) that only surfaced when testing the
+success path with genuinely correct answers rather than random/wrong ones — a reminder that
+testing only the failure path isn't enough when both paths render different messages.
