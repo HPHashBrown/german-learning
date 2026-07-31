@@ -561,19 +561,22 @@ IMMERSION_COINS_PER_HOUR = 15
 
 
 def add_immersion_session(date_str, hours, category, notes):
+    """Records the session and awards XP immediately (XP is never affected by
+    town buildings — only coins are). Returns (xp_earned, base_coins_earned);
+    the caller is responsible for running base_coins_earned through any town
+    coin-bonus calculation and awarding the final coins itself."""
     xp_earned = round(hours * IMMERSION_XP_PER_HOUR)
-    coins_earned = round(hours * IMMERSION_COINS_PER_HOUR)
+    base_coins_earned = round(hours * IMMERSION_COINS_PER_HOUR)
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO immersion_sessions
                (date, hours, category, notes, xp_earned, coins_earned, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (date_str, hours, category, notes, xp_earned, coins_earned,
+            (date_str, hours, category, notes, xp_earned, base_coins_earned,
              dt.datetime.now().isoformat()),
         )
     add_xp(xp_earned, "immersion_hours")
-    add_coins(coins_earned)
-    return xp_earned, coins_earned
+    return xp_earned, base_coins_earned
 
 
 def get_immersion_sessions():
@@ -650,4 +653,6 @@ def export_all_data() -> dict:
             "xp_log": rows("xp_log"),
             "chest_openings": rows("chest_openings"),
             "immersion_sessions": rows("immersion_sessions"),
+            "town_tiles": rows("town_tiles"),
+            "town_profile": rows("town_profile"),
         }
