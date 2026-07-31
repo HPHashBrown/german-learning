@@ -16,6 +16,10 @@ import stories
 import gemini_tools as gt
 import achievements as ach
 import daily_extras
+import town_config as tcfg
+import town_db as tdb
+import town_engine as te
+import tile_challenge as tch
 from srs import sm2, next_due_date
 from styles import inject_css, card_start, card_end, xp_bar, rarity_span
 from effects import play_sound, confetti_burst
@@ -24,6 +28,7 @@ st.set_page_config(page_title="Fluent Forest RPG", page_icon="🐉", layout="wid
                     initial_sidebar_state="expanded")
 
 db.init_db()
+tdb.init_town_db()
 
 
 # ----------------------------------------------------------------------------
@@ -147,6 +152,28 @@ def xp_gain_display(amount: int, profile: dict) -> str:
     return f"{effect['emoji']} +{amount} XP {effect['emoji']}"
 
 
+def award_lesson_coins(base_coins: int) -> dict:
+    """Applies the current world's town-building coin bonus to a lesson's base
+    coin reward, then actually awards the final amount. Returns the full
+    breakdown dict from town_engine.compute_coin_bonus for display."""
+    town_profile = tdb.get_town_profile()
+    world_id = town_profile.get("current_world", "german_village")
+    breakdown = te.compute_coin_bonus(world_id, base_coins)
+    db.add_coins(breakdown["final"])
+    return breakdown
+
+
+def coin_breakdown_caption(breakdown: dict) -> str:
+    parts = [f"{breakdown['base']} base"]
+    if breakdown["flat_bonus"]:
+        parts.append(f"+{breakdown['flat_bonus']:.0f} building bonus")
+    if breakdown["pct_bonus"]:
+        parts.append(f"+{breakdown['pct_bonus']:.0f}% building bonus")
+    if breakdown["world_bonus_pct"]:
+        parts.append(f"+{breakdown['world_bonus_pct']:.0f}% world bonus")
+    return " → ".join(parts) + f" = **{breakdown['final']} 🪙**"
+
+
 def _generate_daily_shop(date_str: str):
     import hashlib
     seed = int(hashlib.md5(date_str.encode()).hexdigest(), 16) % (2**31)
@@ -195,7 +222,7 @@ inject_css(profile.get("equipped_theme", "light"), reduced_motion=False)
 daily_result = process_daily_login()
 
 NAV_PAGES = [
-    "🏠 Home", "🌲 Log Immersion", "📚 Vocabulary Quiz", "🔤 Article Trainer", "🔀 Verb Trainer",
+    "🏠 Home", "🌲 Log Immersion", "🏙️ Town", "📚 Vocabulary Quiz", "🔤 Article Trainer", "🔀 Verb Trainer",
     "📝 Grammar Explorer", "📖 Reading Stories", "🃏 Flashcards", "📇 Vocabulary Manager",
     "💬 AI Chat", "✍️ AI Writing Tutor", "🎤 Pronunciation Trainer",
     "🗺️ CEFR Roadmap", "📊 Statistics", "🎯 Weekly Challenges", "💰 Wallet",
@@ -377,12 +404,14 @@ elif page == "🌲 Log Immersion":
 
         submitted = st.form_submit_button("✅ Log Immersion Time", type="primary", width='stretch')
         if submitted:
-            xp_earned, coins_earned = db.add_immersion_session(
+            xp_earned, base_coins = db.add_immersion_session(
                 log_date.isoformat(), hours, category, notes,
             )
+            breakdown = award_lesson_coins(base_coins)
             week_start = (dt.date.today() - dt.timedelta(days=dt.date.today().weekday())).isoformat()
             db.bump_weekly_progress(week_start, "earn_xp", xp_earned)
-            st.success(f"Logged {hours}h of {category}! {xp_gain_display(xp_earned, profile)}, +{coins_earned} 🪙")
+            st.success(f"Logged {hours}h of {category}! {xp_gain_display(xp_earned, profile)}")
+            st.caption(coin_breakdown_caption(breakdown))
             play_sound("coin", profile.get("sound_enabled", "1") == "1")
             st.rerun()
 
@@ -394,6 +423,209 @@ elif page == "🌲 Log Immersion":
         show = sessions_df[["date", "hours", "category", "notes", "xp_earned", "coins_earned"]].head(20).copy()
         show["date"] = show["date"].dt.strftime("%Y-%m-%d")
         st.dataframe(show, width='stretch', hide_index=True)
+
+
+# ----------------------------------------------------------------------------
+# PAGE: Town
+# ----------------------------------------------------------------------------
+elif page == "🏙️ Town":
+    st.markdown("## 🏙️ Town")
+
+    town_profile = tdb.get_town_profile()
+    world_id = town_profile.get("current_world", "german_village")
+    world = te.get_or_create_world_grid(world_id)
+    tiles_df = tdb.get_tiles(world_id)
+    completion = te.world_completion_pct(world_id)
+    tier = te.current_tier(world_id)
+
+    st.markdown(f"### {world.flag} {world.name}")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        card_start(); st.metric("Town Completion", f"{completion}%"); card_end()
+    with c2:
+        card_start(); st.metric("Current Challenge Tier", tier.title()); card_end()
+    with c3:
+        card_start(); st.metric("Coin Bonus (this world)", f"+{te.total_flat_coin_bonus(world_id)} flat, +{te.total_pct_coin_bonus(world_id):.0f}%"); card_end()
+
+    st.progress(completion / 100)
+
+    if te.is_world_complete(world_id):
+        next_id = tcfg.next_world_id(world_id)
+        if next_id:
+            next_world = tcfg.WORLDS[next_id]
+            st.success(f"🎉 {world.name} is fully expanded!")
+            if st.button(f"Advance to {next_world.flag} {next_world.name}", type="primary"):
+                tdb.set_town_profile("current_world", next_id)
+                te.get_or_create_world_grid(next_id)
+                st.session_state.pop("town_selected", None)
+                st.session_state.pop("town_challenge", None)
+                st.balloons()
+                st.rerun()
+        else:
+            st.success("🌎 You've fully expanded every world — incredible dedication!")
+
+    st.caption("Click a locked tile (🔒) adjacent to your town to attempt to claim it. "
+               "Click an unlocked empty tile to build. Click a building to upgrade it.")
+
+    # ---- Grid rendering (pure Streamlit widgets only, no custom HTML/JS) ----
+    tiles_by_pos = {(int(r["x"]), int(r["y"])): r for _, r in tiles_df.iterrows()}
+    selected = st.session_state.get("town_selected")
+
+    for y in range(world.grid_size):
+        cols = st.columns(world.grid_size)
+        for x in range(world.grid_size):
+            tile = tiles_by_pos.get((x, y))
+            with cols[x]:
+                if tile is None:
+                    st.write("")
+                    continue
+                locked = bool(tile["locked"])
+                if locked:
+                    claimable = te.is_adjacent_to_unlocked(world_id, x, y)
+                    label = "🔒" if claimable else "⬛"
+                    if st.button(label, key=f"tile_{world_id}_{x}_{y}", disabled=not claimable,
+                                 help="Locked — click to attempt a challenge" if claimable else "Unexplored"):
+                        st.session_state.town_selected = {"x": x, "y": y, "action": "claim"}
+                        st.session_state.pop("town_challenge", None)
+                        st.rerun()
+                else:
+                    building_id = tile["building_id"]
+                    if building_id:
+                        building = tcfg.BUILDINGS.get(building_id)
+                        emoji = building.emoji if building else "❓"
+                        lvl = int(tile["building_level"])
+                        help_txt = f"{building.name if building else building_id} (Level {lvl})"
+                    else:
+                        terrain = tcfg.TERRAIN_TYPES.get(tile["terrain_id"])
+                        emoji = terrain.emoji if terrain else "🟩"
+                        help_txt = f"{terrain.name if terrain else 'Empty land'} — click to build"
+                    if st.button(emoji, key=f"tile_{world_id}_{x}_{y}", help=help_txt):
+                        action = "upgrade" if building_id else "build"
+                        st.session_state.town_selected = {"x": x, "y": y, "action": action}
+                        st.session_state.pop("town_challenge", None)
+                        st.rerun()
+
+    st.markdown("---")
+    selected = st.session_state.get("town_selected")
+
+    if not selected:
+        st.info("Select a tile above to get started.")
+    else:
+        sx, sy = selected["x"], selected["y"]
+        action = selected["action"]
+
+        if st.button("✖ Deselect"):
+            st.session_state.pop("town_selected", None)
+            st.session_state.pop("town_challenge", None)
+            st.rerun()
+
+        # ---------------------------------------------------- Claim a tile --
+        if action == "claim":
+            st.markdown(f"### 🔒 Claim Tile ({sx}, {sy})")
+            if "town_challenge" not in st.session_state:
+                challenge = tch.generate_challenge(tier, stats["level"], random.Random())
+                st.session_state.town_challenge = {"challenge": challenge, "answers": {}}
+            ch_state = st.session_state.town_challenge
+            challenge = ch_state["challenge"]
+
+            st.caption(f"Difficulty: {challenge['tier'].title()} — need "
+                       f"{challenge['pass_threshold']*100:.0f}% correct to unlock this tile.")
+
+            for qi, q in enumerate(challenge["questions"]):
+                if q["kind"] == "mc":
+                    ans = st.radio(q["prompt"], q["options"], key=f"town_q_{qi}", index=None)
+                else:
+                    ans = st.text_input(q["prompt"], key=f"town_q_{qi}")
+                ch_state["answers"][qi] = ans
+
+            if st.button("Submit Challenge", type="primary"):
+                answers = [ch_state["answers"].get(qi) for qi in range(len(challenge["questions"]))]
+                result = tch.grade_challenge(challenge, answers)
+                if result["passed"]:
+                    reveal = te.claim_tile_success(world_id, sx, sy)
+                    xp_earned = 30 + 10 * {"easy": 0, "medium": 1, "hard": 2, "advanced": 3}[tier]
+                    base_coins = 15 + 5 * {"easy": 0, "medium": 1, "hard": 2, "advanced": 3}[tier]
+                    db.add_xp(xp_earned, "town_tile_claim")
+                    breakdown = award_lesson_coins(base_coins)
+                    st.balloons()
+                    st.success(
+                        f"🎉 Tile claimed! Discovered **{reveal['terrain'].emoji} "
+                        f"{reveal['terrain'].name}**. {xp_gain_display(xp_earned, profile)}"
+                    )
+                    st.caption(coin_breakdown_caption(breakdown))
+                    st.session_state.pop("town_selected", None)
+                    st.session_state.pop("town_challenge", None)
+                    if st.button("Continue"):
+                        st.rerun()
+                else:
+                    st.error(f"Not quite — {result['correct']}/{result['total']} correct "
+                             f"({result['pct']*100:.0f}%, needed {challenge['pass_threshold']*100:.0f}%). "
+                             f"The tile stays locked, but you can try again anytime.")
+                    if st.button("Try a new challenge"):
+                        st.session_state.pop("town_challenge", None)
+                        st.rerun()
+
+        # ---------------------------------------------------------- Build --
+        elif action == "build":
+            terrain = tcfg.TERRAIN_TYPES.get(tiles_by_pos[(sx, sy)]["terrain_id"])
+            st.markdown(f"### 🏗️ Build on ({sx}, {sy}) — {terrain.emoji if terrain else ''} "
+                        f"{terrain.name if terrain else 'Empty land'}")
+
+            available = tcfg.available_buildings(stats["level"])
+            categories = sorted({b.category for b in available})
+            cat_choice = st.selectbox("Category", categories)
+            cat_buildings = [b for b in available if b.category == cat_choice]
+
+            for b in cat_buildings:
+                cost = te.effective_build_cost(world_id, b)
+                card_start()
+                st.markdown(f"#### {b.emoji} {b.name}")
+                st.caption(b.description)
+                st.markdown(f"Cost: **{cost} 🪙** (Level {b.min_player_level}+ required)")
+                if st.button(f"Build {b.name}", key=f"build_{b.id}"):
+                    if db.spend_coins(cost):
+                        ok, msg, _ = te.build(world_id, sx, sy, b.id, stats["level"])
+                        if ok:
+                            st.toast(f"🏗️ {msg}")
+                            st.session_state.pop("town_selected", None)
+                            st.rerun()
+                        else:
+                            db.add_coins(cost)  # refund since the build itself failed validation
+                            st.error(msg)
+                    else:
+                        st.error("Not enough coins!")
+                card_end()
+
+        # -------------------------------------------------------- Upgrade --
+        elif action == "upgrade":
+            tile = tiles_by_pos[(sx, sy)]
+            building = tcfg.BUILDINGS.get(tile["building_id"])
+            current_level = int(tile["building_level"])
+            st.markdown(f"### {building.emoji} {building.name} — Level {current_level}")
+            st.caption(building.description)
+
+            ok, reason, cost = te.can_upgrade(world_id, sx, sy, stats["level"])
+            if not ok:
+                st.info(reason)
+            else:
+                next_effect = building.effect_at(current_level + 1)
+                st.markdown(f"Upgrade to Level {current_level + 1} for **{cost} 🪙**")
+                if building.effect_type in ("coin_flat",):
+                    st.caption(f"New effect: +{next_effect:.0f} coins per lesson")
+                elif building.effect_type in ("coin_pct",):
+                    st.caption(f"New effect: +{next_effect:.0f}% lesson coin bonus")
+                if st.button("Upgrade", type="primary"):
+                    if db.spend_coins(cost):
+                        ok2, msg2, _ = te.upgrade(world_id, sx, sy, stats["level"])
+                        if ok2:
+                            st.balloons()
+                            st.success(msg2)
+                            st.rerun()
+                        else:
+                            db.add_coins(cost)
+                            st.error(msg2)
+                    else:
+                        st.error("Not enough coins!")
 
 
 # ----------------------------------------------------------------------------
@@ -446,17 +678,18 @@ elif page == "📚 Vocabulary Quiz":
             score, total = quiz["score"], len(quiz["questions"])
             pct = score / total if total else 0
             xp_earned = int(20 * total * pct) + (15 if pct == 1.0 else 0)
-            coins_earned = int(5 * total * pct)
+            base_coins = int(5 * total * pct)
             db.record_quiz("vocabulary", quiz["category"], score, total, xp_earned)
             db.add_xp(xp_earned, "vocabulary_quiz")
-            db.add_coins(coins_earned)
+            breakdown = award_lesson_coins(base_coins)
             week_start = (dt.date.today() - dt.timedelta(days=dt.date.today().weekday())).isoformat()
             db.bump_weekly_progress(week_start, "earn_xp", xp_earned)
             db.bump_weekly_progress(week_start, "complete_quizzes", 1)
 
             card_start()
             st.markdown(f"## Quiz Complete! {score}/{total}")
-            st.markdown(f"**{xp_gain_display(xp_earned, profile)}** &nbsp;&nbsp; **+{coins_earned} 🪙**")
+            st.markdown(f"**{xp_gain_display(xp_earned, profile)}**")
+            st.caption(coin_breakdown_caption(breakdown))
             if pct == 1.0:
                 st.success("🎉 Perfect score bonus applied!")
                 confetti_burst(150)
@@ -682,10 +915,11 @@ elif page == "📖 Reading Stories":
                 if not already_done:
                     xp_earned = 40 + score_pct // 2
                     db.add_xp(xp_earned, "reading_story")
-                    db.add_coins(15)
+                    breakdown = award_lesson_coins(15)
                     week_start = (dt.date.today() - dt.timedelta(days=dt.date.today().weekday())).isoformat()
                     db.bump_weekly_progress(week_start, "finish_stories", 1)
-                    st.success(f"Comprehension: {score_pct}%! {xp_gain_display(xp_earned, profile)}, +15 🪙")
+                    st.success(f"Comprehension: {score_pct}%! {xp_gain_display(xp_earned, profile)}")
+                    st.caption(coin_breakdown_caption(breakdown))
                     if score_pct == 100:
                         confetti_burst(120)
                 else:
