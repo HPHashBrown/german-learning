@@ -97,9 +97,18 @@ def unlock_starting_area(world_id: str, center_x: int, center_y: int, radius: in
 def get_tiles(world_id: str):
     import pandas as pd
     with maindb.get_conn() as conn:
-        return pd.read_sql_query(
+        df = pd.read_sql_query(
             "SELECT * FROM town_tiles WHERE world_id = ? ORDER BY y, x", conn, params=(world_id,)
         )
+    # pandas represents SQL NULLs in object columns as float('nan') once a
+    # column has a mix of real values and NULLs — and bool(float('nan')) is
+    # True in Python, which silently breaks every "if building_id:" style
+    # check downstream. Normalize back to real None right here, once, so
+    # every consumer of this DataFrame can use plain truthiness safely.
+    for col in ("terrain_id", "building_id", "decoration_id", "unlocked_at"):
+        if col in df.columns:
+            df[col] = df[col].astype(object).where(df[col].notna(), None)
+    return df
 
 
 def get_tile(world_id: str, x: int, y: int):
