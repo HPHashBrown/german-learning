@@ -573,7 +573,7 @@ elif page == "🏙️ Town":
 
             available = tcfg.available_buildings(stats["level"])
             categories = sorted({b.category for b in available})
-            cat_choice = st.selectbox("Category", categories)
+            cat_choice = st.selectbox("Category", categories, key="build_category_select")
             cat_buildings = [b for b in available if b.category == cat_choice]
 
             for b in cat_buildings:
