@@ -464,6 +464,34 @@ elif page == "🏙️ Town":
         else:
             st.success("🌎 You've fully expanded every world — incredible dedication!")
 
+    with st.expander(f"🔒 Locked Buildings — see what unlocks as you level up"):
+        locked = tcfg.locked_buildings(stats["level"])
+        if not locked:
+            st.caption("You've unlocked every building in the catalog!")
+        else:
+            category_icons = {
+                "residential": "🏘️", "commercial": "🏪", "educational": "🎓",
+                "cultural": "🏛️", "utility": "🛠️", "decoration": "🎨",
+            }
+            by_category = {}
+            for b in locked:
+                by_category.setdefault(b.category, []).append(b)
+
+            cat_tabs = st.tabs([f"{category_icons.get(c, '')} {c.title()}" for c in by_category])
+            for tab, (category, buildings) in zip(cat_tabs, by_category.items()):
+                with tab:
+                    for b in buildings:
+                        xp_needed = max(0, levels.xp_for_level(b.min_player_level) - stats["xp"])
+                        c1, c2 = st.columns([3, 2])
+                        with c1:
+                            st.markdown(f"**{b.emoji} {b.name}**")
+                            st.caption(b.description)
+                        with c2:
+                            st.markdown(f"🔒 Level {b.min_player_level}")
+                            if xp_needed > 0:
+                                st.caption(f"{xp_needed:,} XP to go")
+                        st.markdown("---")
+
     st.caption("Click a locked tile (🔒) adjacent to your town to attempt to claim it. "
                "Click an unlocked empty tile to build. Click a building to upgrade it.")
 
