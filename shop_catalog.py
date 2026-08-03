@@ -106,6 +106,14 @@ for iid, name, rarity, emoji in [
 ]:
     _add(iid, name, "xp_effect", rarity, emoji)
 
+# ------------------------------------------------------------- Sound Packs --
+for iid, name, rarity, emoji in [
+    ("sound_classic", "Classic Chimes", "common", "🔊"),
+    ("sound_chiptune", "Chiptune", "uncommon", "👾"),
+    ("sound_soft_chimes", "Soft Chimes", "uncommon", "🎐"),
+]:
+    _add(iid, name, "sound_pack", rarity, emoji)
+
 
 def items_by_type(item_type):
     return [v for v in CATALOG.values() if v["type"] == item_type]
