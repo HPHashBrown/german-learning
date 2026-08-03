@@ -43,6 +43,7 @@ class BuildingLevel:
     coin_cost: int
     effect_value: float          # meaning depends on effect_type (see Building)
     min_player_level: int = 1
+    emoji_override: str = ""     # if set, building shows this emoji once it reaches this level
 
 
 @dataclass(frozen=True)
@@ -55,7 +56,8 @@ class Building:
     levels: tuple[BuildingLevel, ...]
     effect_type: str             # see EFFECT_TYPES below
     description: str = ""
-    preferred_terrain: str = ""  # optional, unused mechanically today (future hook)
+    preferred_terrain: str = ""  # optional: building's effect gets a bonus when built on this terrain
+    required_terrain: str = ""   # optional: building can ONLY be built on this terrain (hard gate)
     unlock_content_key: str = "" # for cultural buildings; read by app.py to gate content
 
     @property
@@ -78,6 +80,18 @@ class Building:
         idx = min(level, self.max_level) - 1
         return self.levels[idx].effect_value
 
+    def visual_emoji(self, level: int) -> str:
+        """Returns the emoji this building shows at the given level — walks
+        backward from the current level to find the most recent tier that
+        defined an emoji_override, falling back to the base emoji if none did."""
+        if level < 1:
+            return self.emoji
+        idx = min(level, self.max_level) - 1
+        for i in range(idx, -1, -1):
+            if self.levels[i].emoji_override:
+                return self.levels[i].emoji_override
+        return self.emoji
+
 
 # Effect types:
 #   "coin_flat"        — flat coins added to every lesson/immersion reward
@@ -99,8 +113,15 @@ def _add_building(b: Building):
 # Residential — no XP, no coin effect, purely town development.
 _add_building(Building(
     id="house", name="House", category="residential", emoji="🏠", min_player_level=1,
-    levels=tuple(BuildingLevel(coin_cost=c, effect_value=0) for c in [50, 120, 250, 450, 700]),
-    effect_type="none", description="Basic housing. Grows your town's population feel.",
+    levels=(
+        BuildingLevel(coin_cost=50, effect_value=0),
+        BuildingLevel(coin_cost=120, effect_value=0),
+        BuildingLevel(coin_cost=250, effect_value=0, emoji_override="🏡"),
+        BuildingLevel(coin_cost=450, effect_value=0),
+        BuildingLevel(coin_cost=700, effect_value=0, emoji_override="🏘️"),
+    ),
+    effect_type="none", description="Basic housing. Grows your town's population feel — "
+                                     "visibly evolves as it levels up.",
 ))
 _add_building(Building(
     id="apartment", name="Apartment", category="residential", emoji="🏢", min_player_level=5,
@@ -121,9 +142,14 @@ _add_building(Building(
 # Commercial — boosts lesson coin rewards. Never passive income.
 _add_building(Building(
     id="bakery", name="Bakery", category="commercial", emoji="🥐", min_player_level=1,
-    levels=tuple(BuildingLevel(coin_cost=c, effect_value=v) for c, v in
-                 [(80, 10), (160, 20), (300, 35), (500, 55), (800, 80)]),
-    effect_type="coin_flat", description="+coins per completed lesson.",
+    levels=(
+        BuildingLevel(coin_cost=80, effect_value=10),
+        BuildingLevel(coin_cost=160, effect_value=20),
+        BuildingLevel(coin_cost=300, effect_value=35, emoji_override="🍞"),
+        BuildingLevel(coin_cost=500, effect_value=55),
+        BuildingLevel(coin_cost=800, effect_value=80, emoji_override="🏪"),
+    ),
+    effect_type="coin_flat", description="+coins per completed lesson. Evolves visually as it levels up.",
 ))
 _add_building(Building(
     id="cafe", name="Café", category="commercial", emoji="☕", min_player_level=5,
@@ -160,9 +186,13 @@ _add_building(Building(
 # comes from buildings, only from actually completing lessons/challenges).
 _add_building(Building(
     id="library", name="Library", category="educational", emoji="📚", min_player_level=5,
-    levels=tuple(BuildingLevel(coin_cost=c, effect_value=v) for c, v in
-                 [(200, 5), (400, 8), (700, 12), (1100, 18)]),
-    effect_type="coin_pct", description="+% bonus on lesson coin rewards.",
+    levels=(
+        BuildingLevel(coin_cost=200, effect_value=5),
+        BuildingLevel(coin_cost=400, effect_value=8),
+        BuildingLevel(coin_cost=700, effect_value=12, emoji_override="🏛️"),
+        BuildingLevel(coin_cost=1100, effect_value=18),
+    ),
+    effect_type="coin_pct", description="+% bonus on lesson coin rewards. Evolves visually as it levels up.",
 ))
 _add_building(Building(
     id="school", name="School", category="educational", emoji="🏫", min_player_level=10,
@@ -207,6 +237,42 @@ _add_building(Building(
     levels=(BuildingLevel(coin_cost=3000, effect_value=0),),
     effect_type="content_unlock", unlock_content_key="advanced_stories",
     description="Unlocks the hardest reading stories.",
+))
+
+# Terrain-tied buildings — per the brief's own examples. "Requires" terrain
+# is a hard build gate; "performs better on" is a soft bonus (preferred_terrain).
+_add_building(Building(
+    id="water_mill", name="Water Mill", category="commercial", emoji="💧", min_player_level=8,
+    levels=tuple(BuildingLevel(coin_cost=c, effect_value=v) for c, v in
+                 [(350, 25), (600, 45), (950, 70)]),
+    effect_type="coin_flat", required_terrain="river",
+    description="+coins per completed lesson. Can only be built on River terrain.",
+))
+_add_building(Building(
+    id="farm", name="Farm", category="commercial", emoji="🌻", min_player_level=3,
+    levels=(
+        BuildingLevel(coin_cost=120, effect_value=12),
+        BuildingLevel(coin_cost=240, effect_value=22, emoji_override="🌾"),
+        BuildingLevel(coin_cost=420, effect_value=38),
+        BuildingLevel(coin_cost=650, effect_value=58, emoji_override="🚜"),
+    ),
+    effect_type="coin_flat", preferred_terrain="grassland",
+    description="+coins per completed lesson. Effect is boosted 50% when built on Grassland. "
+                "Evolves visually as it levels up.",
+))
+_add_building(Building(
+    id="lumber_mill", name="Lumber Mill", category="utility", emoji="🪵", min_player_level=8,
+    levels=tuple(BuildingLevel(coin_cost=c, effect_value=v) for c, v in
+                 [(300, 4), (550, 7), (850, 10)]),
+    effect_type="construction_discount_pct", required_terrain="forest",
+    description="Reduces building costs town-wide. Can only be built on Forest terrain.",
+))
+_add_building(Building(
+    id="stone_quarry", name="Stone Quarry", category="utility", emoji="⛏️", min_player_level=8,
+    levels=tuple(BuildingLevel(coin_cost=c, effect_value=v) for c, v in
+                 [(350, 4), (600, 7)]),
+    effect_type="upgrade_discount_pct", required_terrain="rocky",
+    description="Reduces upgrade costs town-wide. Can only be built on Rocky Ground.",
 ))
 
 # Utility — global, non-adjacency bonuses per the brief.
@@ -330,6 +396,12 @@ TIER_ORDER = ["easy", "medium", "hard", "advanced"]
 
 TIER_PASS_THRESHOLD = {"easy": 0.6, "medium": 0.7, "hard": 0.8, "advanced": 0.9}
 TIER_QUESTION_COUNT = {"easy": 5, "medium": 5, "hard": 5, "advanced": 6}
+
+# Multiplier applied to a building's effect when it sits on its preferred_terrain.
+PREFERRED_TERRAIN_BONUS_MULT = 1.5
+
+# Relocating a building costs this fraction of its current build cost.
+MOVE_COST_PCT = 0.5
 
 
 def tier_for_claimed_count(claimed_count: int, world_difficulty_offset: int = 0) -> str:
