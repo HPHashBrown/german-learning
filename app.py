@@ -1,6 +1,7 @@
 import datetime as dt
 import json
 import random
+import time
 
 import pandas as pd
 import streamlit as st
@@ -20,9 +21,11 @@ import town_config as tcfg
 import town_db as tdb
 import town_engine as te
 import tile_challenge as tch
+import town_snapshot as tsnap
+import listening_content as lc
 from srs import sm2, next_due_date
 from styles import inject_css, card_start, card_end, xp_bar, rarity_span
-from effects import play_sound, confetti_burst
+from effects import play_sound, confetti_burst, speak_german
 
 st.set_page_config(page_title="Fluent Forest RPG", page_icon="🐉", layout="wide",
                     initial_sidebar_state="expanded")
@@ -126,6 +129,12 @@ def check_achievements(stats):
     return newly
 
 
+def sound_pack_key(profile) -> str:
+    """Maps the equipped 'sound_XXX' shop item id to the effects.SOUND_PACKS key."""
+    item_id = profile.get("equipped_sound_pack", "sound_classic") or "sound_classic"
+    return item_id.replace("sound_", "", 1)
+
+
 def equipped_pet_emoji(profile):
     pet_id = profile.get("equipped_pet", "")
     item = sc.get_item(pet_id) if pet_id else None
@@ -199,14 +208,14 @@ def _get_daily_shop():
     return existing if existing else _generate_daily_shop(today_str)
 
 
-def _buy_item(item_id: str, price: int, sound_enabled: bool):
+def _buy_item(item_id: str, price: int, sound_enabled: bool, pack: str = "classic"):
     if db.owns_item(item_id):
         st.info("You already own this!")
         return
     if db.spend_coins(price):
         item = sc.get_item(item_id)
         db.grant_item(item["id"], item["type"], item["rarity"], via="shop")
-        play_sound("coin", sound_enabled)
+        play_sound("coin", sound_enabled, pack=pack)
         st.toast(f"Purchased {item['name']}!")
         st.rerun()
     else:
@@ -225,7 +234,8 @@ NAV_PAGES = [
     "🏠 Home", "🌲 Log Immersion", "🏙️ Town", "📚 Vocabulary Quiz", "🔤 Article Trainer", "🔀 Verb Trainer",
     "📝 Grammar Explorer", "📖 Reading Stories", "🃏 Flashcards", "📇 Vocabulary Manager",
     "💬 AI Chat", "✍️ AI Writing Tutor", "🎤 Pronunciation Trainer",
-    "🗺️ CEFR Roadmap", "📊 Statistics", "🎯 Weekly Challenges", "💰 Wallet",
+    "🗺️ CEFR Roadmap", "📊 Statistics", "🏅 Personal Records", "🎯 Weekly Challenges", "💰 Wallet",
+    "🎧 Listening Practice",
     "🛍️ Shop", "📦 Loot Chests", "🧑‍🎨 Avatar", "🏆 Trophy Room", "⚙️ Settings",
 ]
 
@@ -269,7 +279,10 @@ for a in newly_ach:
 # ----------------------------------------------------------------------------
 if page == "🏠 Home":
     theme_item = sc.get_item(profile.get("equipped_theme", "light"))
-    st.markdown(f"# Willkommen zurück, {profile.get('display_name','Sprachheld')}! {theme_item['emoji'] if theme_item else ''}")
+    title_item = sc.get_item(profile.get("equipped_title", ""))
+    title_suffix = f" — *{title_item['name']}*" if title_item else ""
+    st.markdown(f"# Willkommen zurück, {profile.get('display_name','Sprachheld')}! "
+                f"{theme_item['emoji'] if theme_item else ''}{title_suffix}")
 
     if daily_result:
         card_start()
@@ -278,7 +291,7 @@ if page == "🏠 Home":
         st.caption(f"Current streak: {daily_result['streak']} days")
         card_end()
         confetti_burst(100)
-        play_sound("daily_reward", profile.get("sound_enabled", "1") == "1")
+        play_sound("daily_reward", profile.get("sound_enabled", "1") == "1", pack=sound_pack_key(profile))
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -412,7 +425,7 @@ elif page == "🌲 Log Immersion":
             db.bump_weekly_progress(week_start, "earn_xp", xp_earned)
             st.success(f"Logged {hours}h of {category}! {xp_gain_display(xp_earned, profile)}")
             st.caption(coin_breakdown_caption(breakdown))
-            play_sound("coin", profile.get("sound_enabled", "1") == "1")
+            play_sound("coin", profile.get("sound_enabled", "1") == "1", pack=sound_pack_key(profile))
             st.rerun()
 
     st.markdown("### Recent Sessions")
@@ -448,6 +461,17 @@ elif page == "🏙️ Town":
         card_start(); st.metric("Coin Bonus (this world)", f"+{te.total_flat_coin_bonus(world_id)} flat, +{te.total_pct_coin_bonus(world_id):.0f}%"); card_end()
 
     st.progress(completion / 100)
+
+    snap_col1, snap_col2 = st.columns([1, 4])
+    with snap_col1:
+        if st.button("📸 Snapshot"):
+            st.session_state["town_snapshot_bytes"] = tsnap.render_town_image(world, tiles_df, completion)
+    with snap_col2:
+        if "town_snapshot_bytes" in st.session_state:
+            st.download_button(
+                "⬇️ Download PNG", st.session_state["town_snapshot_bytes"],
+                file_name=f"{world_id}_town.png", mime="image/png",
+            )
 
     if te.is_world_complete(world_id):
         next_id = tcfg.next_world_id(world_id)
@@ -498,6 +522,18 @@ elif page == "🏙️ Town":
     # ---- Grid rendering (pure Streamlit widgets only, no custom HTML/JS) ----
     tiles_by_pos = {(int(r["x"]), int(r["y"])): r for _, r in tiles_df.iterrows()}
     selected = st.session_state.get("town_selected")
+    moving_from = st.session_state.get("town_moving_from")
+
+    if moving_from:
+        source_tile = tiles_by_pos.get((moving_from["x"], moving_from["y"]))
+        source_building = tcfg.BUILDINGS.get(source_tile["building_id"]) if source_tile is not None else None
+        move_cost_amount = te.move_cost(source_building) if source_building else 0
+        st.info(f"🚚 Moving **{source_building.name if source_building else 'building'}** from "
+                f"({moving_from['x']}, {moving_from['y']}) — click an empty unlocked tile to place it "
+                f"there for **{move_cost_amount} 🪙**, or cancel below.")
+        if st.button("✖ Cancel Move"):
+            st.session_state.pop("town_moving_from", None)
+            st.rerun()
 
     for y in range(world.grid_size):
         cols = st.columns(world.grid_size)
@@ -508,6 +544,34 @@ elif page == "🏙️ Town":
                     st.write("")
                     continue
                 locked = bool(tile["locked"])
+
+                if moving_from:
+                    is_valid_destination = (not locked) and (not tile["building_id"])
+                    if is_valid_destination:
+                        terrain = tcfg.TERRAIN_TYPES.get(tile["terrain_id"])
+                        emoji = terrain.emoji if terrain else "🟩"
+                        if st.button(emoji, key=f"tile_{world_id}_{x}_{y}", help="Place building here"):
+                            ok, msg, cost = te.move_building(
+                                world_id, moving_from["x"], moving_from["y"], x, y,
+                            )
+                            if ok:
+                                if db.spend_coins(cost):
+                                    st.toast(f"🚚 {msg}")
+                                else:
+                                    # shouldn't normally happen since we show cost upfront, but stay safe
+                                    tdb.relocate_building(world_id, x, y, moving_from["x"], moving_from["y"])
+                                    st.error("Not enough coins — move cancelled.")
+                            else:
+                                st.error(msg)
+                            st.session_state.pop("town_moving_from", None)
+                            st.session_state.pop("town_selected", None)
+                            st.rerun()
+                    else:
+                        label = "⬛" if locked else ("🏗️" if tile["building_id"] else "🟩")
+                        st.button(label, key=f"tile_{world_id}_{x}_{y}", disabled=True,
+                                  help="Not a valid destination")
+                    continue
+
                 if locked:
                     claimable = te.is_adjacent_to_unlocked(world_id, x, y)
                     label = "🔒" if claimable else "⬛"
@@ -518,15 +582,20 @@ elif page == "🏙️ Town":
                         st.rerun()
                 else:
                     building_id = tile["building_id"]
+                    decoration_id = tile["decoration_id"]
+                    decoration = tcfg.BUILDINGS.get(decoration_id) if decoration_id else None
                     if building_id:
                         building = tcfg.BUILDINGS.get(building_id)
-                        emoji = building.emoji if building else "❓"
                         lvl = int(tile["building_level"])
+                        emoji = building.visual_emoji(lvl) if building else "❓"
                         help_txt = f"{building.name if building else building_id} (Level {lvl})"
                     else:
                         terrain = tcfg.TERRAIN_TYPES.get(tile["terrain_id"])
                         emoji = terrain.emoji if terrain else "🟩"
                         help_txt = f"{terrain.name if terrain else 'Empty land'} — click to build"
+                    if decoration:
+                        emoji = f"{emoji}{decoration.emoji}"
+                        help_txt += f" · decorated with {decoration.name}"
                     if st.button(emoji, key=f"tile_{world_id}_{x}_{y}", help=help_txt):
                         action = "upgrade" if building_id else "build"
                         st.session_state.town_selected = {"x": x, "y": y, "action": action}
@@ -599,10 +668,18 @@ elif page == "🏙️ Town":
             st.markdown(f"### 🏗️ Build on ({sx}, {sy}) — {terrain.emoji if terrain else ''} "
                         f"{terrain.name if terrain else 'Empty land'}")
 
+            current_decoration_id = tiles_by_pos[(sx, sy)]["decoration_id"]
+            if current_decoration_id:
+                deco = tcfg.BUILDINGS.get(current_decoration_id)
+                st.caption(f"🎨 Already decorated with {deco.emoji if deco else ''} "
+                           f"{deco.name if deco else current_decoration_id}")
+
             available = tcfg.available_buildings(stats["level"])
             categories = sorted({b.category for b in available})
             cat_choice = st.selectbox("Category", categories, key="build_category_select")
             cat_buildings = [b for b in available if b.category == cat_choice]
+
+            current_terrain_id = tiles_by_pos[(sx, sy)]["terrain_id"]
 
             for b in cat_buildings:
                 cost = te.effective_build_cost(world_id, b)
@@ -610,7 +687,26 @@ elif page == "🏙️ Town":
                 st.markdown(f"#### {b.emoji} {b.name}")
                 st.caption(b.description)
                 st.markdown(f"Cost: **{cost} 🪙** (Level {b.min_player_level}+ required)")
-                if st.button(f"Build {b.name}", key=f"build_{b.id}"):
+
+                terrain_blocked = False
+                if b.required_terrain:
+                    req_terrain = tcfg.TERRAIN_TYPES.get(b.required_terrain)
+                    if current_terrain_id == b.required_terrain:
+                        st.success(f"✅ {req_terrain.emoji} Built on its required terrain!")
+                    else:
+                        terrain_blocked = True
+                        st.warning(f"⚠️ Requires {req_terrain.emoji} {req_terrain.name} terrain — "
+                                   f"this tile is {tcfg.TERRAIN_TYPES.get(current_terrain_id).name if current_terrain_id in tcfg.TERRAIN_TYPES else 'unsuitable'}.")
+                elif b.preferred_terrain:
+                    pref_terrain = tcfg.TERRAIN_TYPES.get(b.preferred_terrain)
+                    if current_terrain_id == b.preferred_terrain:
+                        st.success(f"✨ +{int((tcfg.PREFERRED_TERRAIN_BONUS_MULT-1)*100)}% bonus — "
+                                   f"built on its preferred {pref_terrain.emoji} {pref_terrain.name}!")
+                    else:
+                        st.caption(f"💡 Gets a +{int((tcfg.PREFERRED_TERRAIN_BONUS_MULT-1)*100)}% bonus "
+                                   f"on {pref_terrain.emoji} {pref_terrain.name} terrain.")
+
+                if st.button(f"Build {b.name}", key=f"build_{b.id}", disabled=terrain_blocked):
                     if db.spend_coins(cost):
                         ok, msg, _ = te.build(world_id, sx, sy, b.id, stats["level"])
                         if ok:
@@ -640,8 +736,15 @@ elif page == "🏙️ Town":
                     st.session_state.pop("town_selected", None)
                     st.rerun()
             else:
-                st.markdown(f"### {building.emoji} {building.name} — Level {current_level}")
+                st.markdown(f"### {building.visual_emoji(current_level)} {building.name} — Level {current_level}")
                 st.caption(building.description)
+
+                mc1, mc2 = st.columns([2, 1])
+                with mc2:
+                    if st.button("🚚 Move", help=f"Relocate this building for {te.move_cost(building)} 🪙"):
+                        st.session_state.town_moving_from = {"x": sx, "y": sy}
+                        st.session_state.pop("town_selected", None)
+                        st.rerun()
 
                 ok, reason, cost = te.can_upgrade(world_id, sx, sy, stats["level"])
                 if not ok:
@@ -663,6 +766,39 @@ elif page == "🏙️ Town":
                             else:
                                 db.add_coins(cost)
                                 st.error(msg2)
+                        else:
+                            st.error("Not enough coins!")
+
+                st.markdown("---")
+                st.markdown("#### 🎨 Decoration")
+                current_deco_id = tile["decoration_id"]
+                if current_deco_id:
+                    deco = tcfg.BUILDINGS.get(current_deco_id)
+                    dc1, dc2 = st.columns([3, 1])
+                    with dc1:
+                        st.markdown(f"{deco.emoji if deco else ''} **{deco.name if deco else current_deco_id}**")
+                    with dc2:
+                        if st.button("Remove", key="remove_deco"):
+                            tdb.remove_decoration(world_id, sx, sy)
+                            st.rerun()
+                else:
+                    deco_options = [b for b in tcfg.available_buildings(stats["level"]) if b.category == "decoration"]
+                    deco_labels = {f"{b.emoji} {b.name} — {b.build_cost()} 🪙": b for b in deco_options}
+                    deco_label_choice = st.selectbox(
+                        "Add a decoration to this tile", list(deco_labels.keys()),
+                        key="upgrade_panel_deco_select",
+                    )
+                    deco_choice = deco_labels.get(deco_label_choice)
+                    if deco_choice and st.button(f"Place {deco_choice.name}", key="place_deco"):
+                        deco_cost = te.effective_build_cost(world_id, deco_choice)
+                        if db.spend_coins(deco_cost):
+                            ok3, msg3, _ = te.build(world_id, sx, sy, deco_choice.id, stats["level"])
+                            if ok3:
+                                st.toast(f"🎨 {msg3}")
+                                st.rerun()
+                            else:
+                                db.add_coins(deco_cost)
+                                st.error(msg3)
                         else:
                             st.error("Not enough coins!")
 
@@ -706,10 +842,10 @@ elif page == "📚 Vocabulary Quiz":
                     if correct:
                         quiz["score"] += 1
                         st.success(f"Correct! Your pet {pet_react('happy')}")
-                        play_sound("correct", profile.get("sound_enabled", "1") == "1")
+                        play_sound("correct", profile.get("sound_enabled", "1") == "1", pack=sound_pack_key(profile))
                     else:
                         st.error(f"Not quite — the answer was **{q['correct']}**. Your pet {pet_react('sad')}")
-                        play_sound("incorrect", profile.get("sound_enabled", "1") == "1")
+                        play_sound("incorrect", profile.get("sound_enabled", "1") == "1", pack=sound_pack_key(profile))
                     quiz["index"] += 1
                     st.rerun()
             card_end()
@@ -732,7 +868,7 @@ elif page == "📚 Vocabulary Quiz":
             if pct == 1.0:
                 st.success("🎉 Perfect score bonus applied!")
                 confetti_burst(150)
-                play_sound("level_up", profile.get("sound_enabled", "1") == "1")
+                play_sound("level_up", profile.get("sound_enabled", "1") == "1", pack=sound_pack_key(profile))
             if st.button("Take Another Quiz"):
                 st.session_state.vocab_quiz = None
                 st.rerun()
@@ -801,48 +937,162 @@ elif page == "🔀 Verb Trainer":
     if not levels.is_unlocked("Verb Trainer", stats["level"]):
         st.warning(f"🔒 Verb Trainer unlocks at Level 7. You're currently Level {stats['level']}.")
     else:
-        mode = st.selectbox("Mode", ["mixed", "weak", "strong"], format_func=lambda m: {
-            "mixed": "Mixed", "weak": "Weak Verbs (regular)", "strong": "Strong Verbs (irregular)",
-        }[m])
+        verb_set_labels = {"Mixed": "mixed", "Weak Verbs (regular)": "weak", "Strong Verbs (irregular)": "strong"}
+        verb_set_label = st.selectbox("Verb Set", list(verb_set_labels.keys()), key="verb_set_select")
+        mode = verb_set_labels[verb_set_label]
+
+        round_type_labels = {
+            "Standard (10 questions)": "standard",
+            "⏱️ Speed Round (60 seconds)": "speed",
+            "🔥 Infinite Streak (until you miss one)": "infinite",
+        }
+        round_type_label = st.selectbox("Round Type", list(round_type_labels.keys()), key="verb_round_type_select")
+        round_type = round_type_labels[round_type_label]
 
         if "verb_game" not in st.session_state:
             st.session_state.verb_game = None
 
-        if st.session_state.verb_game is None or st.session_state.verb_game.get("mode") != mode:
-            if st.button("Start (10 questions)", type="primary"):
-                qs = [grammar.make_verb_question(mode, random.Random()) for _ in range(10)]
-                st.session_state.verb_game = {"mode": mode, "questions": qs, "index": 0, "score": 0}
+        game = st.session_state.verb_game
+        needs_new_round = (
+            game is None or game.get("mode") != mode or game.get("round_type") != round_type
+        )
+
+        if needs_new_round:
+            best_streak = int(profile.get("verb_trainer_best_streak", "0") or 0)
+            if round_type == "infinite" and best_streak:
+                st.caption(f"🏅 Your best streak so far: {best_streak}")
+            button_label = {
+                "standard": "Start (10 questions)",
+                "speed": "Start Speed Round (60s)",
+                "infinite": "Start Infinite Streak",
+            }[round_type]
+            if st.button(button_label, type="primary"):
+                if round_type == "standard":
+                    qs = [grammar.make_verb_question(mode, random.Random()) for _ in range(10)]
+                    st.session_state.verb_game = {
+                        "mode": mode, "round_type": round_type, "questions": qs, "index": 0, "score": 0,
+                    }
+                elif round_type == "speed":
+                    st.session_state.verb_game = {
+                        "mode": mode, "round_type": round_type, "start_time": time.time(),
+                        "duration": 60, "score": 0, "attempted": 0,
+                        "current_q": grammar.make_verb_question(mode, random.Random()),
+                    }
+                else:  # infinite
+                    st.session_state.verb_game = {
+                        "mode": mode, "round_type": round_type, "streak": 0,
+                        "current_q": grammar.make_verb_question(mode, random.Random()),
+                    }
                 st.rerun()
         else:
-            game = st.session_state.verb_game
-            idx = game["index"]
-            if idx < len(game["questions"]):
-                q = game["questions"][idx]
+            # ---------------------------------------------------- Standard --
+            if round_type == "standard":
+                idx = game["index"]
+                if idx < len(game["questions"]):
+                    q = game["questions"][idx]
+                    card_start()
+                    st.markdown(f"**Question {idx+1}/10**")
+                    st.markdown(f"### {q['pronoun']} ___ ({q['verb']})")
+                    answer = st.text_input("Your answer", key=f"verb_answer_{idx}")
+                    if st.button("Submit", key=f"verb_submit_{idx}"):
+                        correct = answer.strip().lower() == q["correct"].lower()
+                        if correct:
+                            game["score"] += 1
+                            st.success("Richtig!")
+                        else:
+                            st.error(f"The correct form was **{q['correct']}**")
+                        game["index"] += 1
+                        st.rerun()
+                    card_end()
+                else:
+                    score = game["score"]
+                    xp_earned = score * 10
+                    db.add_xp(xp_earned, "verb_trainer")
+                    db.record_quiz("verb", mode, score, 10, xp_earned)
+                    card_start()
+                    st.markdown(f"## Done! {score}/10 correct — **{xp_gain_display(xp_earned, profile)}**")
+                    if st.button("Play Again"):
+                        st.session_state.verb_game = None
+                        st.rerun()
+                    card_end()
+
+            # ------------------------------------------------------ Speed --
+            elif round_type == "speed":
+                elapsed = time.time() - game["start_time"]
+                remaining = max(0, game["duration"] - elapsed)
+
+                if remaining <= 0:
+                    score, attempted = game["score"], game["attempted"]
+                    xp_earned = score * 8
+                    db.add_xp(xp_earned, "verb_trainer")
+                    db.record_quiz("verb", f"{mode}_speed", score, max(attempted, 1), xp_earned)
+                    card_start()
+                    st.markdown(f"## ⏱️ Time's up! {score}/{attempted} correct")
+                    st.markdown(f"**{xp_gain_display(xp_earned, profile)}**")
+                    if st.button("Play Again", key="speed_again"):
+                        st.session_state.verb_game = None
+                        st.rerun()
+                    card_end()
+                else:
+                    q = game["current_q"]
+                    card_start()
+                    st.markdown(f"⏱️ **~{remaining:.0f}s left** (updates when you answer — no live JS ticker) "
+                                f"· Score: {game['score']}/{game['attempted']}")
+                    st.markdown(f"### {q['pronoun']} ___ ({q['verb']})")
+                    answer = st.text_input("Your answer", key=f"speed_answer_{game['attempted']}")
+                    if st.button("Submit", key=f"speed_submit_{game['attempted']}"):
+                        correct = answer.strip().lower() == q["correct"].lower()
+                        game["attempted"] += 1
+                        if correct:
+                            game["score"] += 1
+                            st.success("Richtig!")
+                        else:
+                            st.error(f"The correct form was **{q['correct']}**")
+                        game["current_q"] = grammar.make_verb_question(mode, random.Random())
+                        st.rerun()
+                    card_end()
+
+            # --------------------------------------------------- Infinite --
+            else:
+                q = game["current_q"]
                 card_start()
-                st.markdown(f"**Question {idx+1}/10**")
+                st.markdown(f"🔥 **Current streak: {game['streak']}**")
                 st.markdown(f"### {q['pronoun']} ___ ({q['verb']})")
-                answer = st.text_input("Your answer", key=f"verb_answer_{idx}")
-                if st.button("Submit", key=f"verb_submit_{idx}"):
+                answer = st.text_input("Your answer", key=f"infinite_answer_{game['streak']}")
+                if st.button("Submit", key=f"infinite_submit_{game['streak']}"):
                     correct = answer.strip().lower() == q["correct"].lower()
                     if correct:
-                        game["score"] += 1
-                        st.success("Richtig!")
+                        game["streak"] += 1
+                        st.success("Richtig! Keep going!")
+                        game["current_q"] = grammar.make_verb_question(mode, random.Random())
+                        st.rerun()
                     else:
-                        st.error(f"The correct form was **{q['correct']}**")
-                    game["index"] += 1
-                    st.rerun()
+                        final_streak = game["streak"]
+                        xp_earned = final_streak * 12
+                        db.add_xp(xp_earned, "verb_trainer")
+                        db.record_quiz("verb", f"{mode}_infinite", final_streak, final_streak + 1, xp_earned)
+                        best_streak = int(profile.get("verb_trainer_best_streak", "0") or 0)
+                        new_record = final_streak > best_streak
+                        if new_record:
+                            db.set_profile("verb_trainer_best_streak", final_streak)
+                        st.session_state["verb_game_result"] = {
+                            "final_streak": final_streak, "xp_earned": xp_earned,
+                            "correct_answer": q["correct"], "new_record": new_record,
+                        }
+                        st.session_state.verb_game = None
+                        st.rerun()
                 card_end()
-            else:
-                score = game["score"]
-                xp_earned = score * 10
-                db.add_xp(xp_earned, "verb_trainer")
-                db.record_quiz("verb", mode, score, 10, xp_earned)
-                card_start()
-                st.markdown(f"## Done! {score}/10 correct — **{xp_gain_display(xp_earned, profile)}**")
-                if st.button("Play Again"):
-                    st.session_state.verb_game = None
-                    st.rerun()
-                card_end()
+
+        if "verb_game_result" in st.session_state:
+            result = st.session_state.pop("verb_game_result")
+            card_start()
+            st.markdown(f"## 🔥 Streak ended at {result['final_streak']}")
+            st.caption(f"The correct form was **{result['correct_answer']}**")
+            st.markdown(f"**{xp_gain_display(result['xp_earned'], profile)}**")
+            if result["new_record"]:
+                st.success("🏅 New personal best streak!")
+                confetti_burst(120)
+            card_end()
 
 
 # ----------------------------------------------------------------------------
@@ -855,9 +1105,23 @@ elif page == "📝 Grammar Explorer":
         st.warning(f"🔒 Full Grammar Explorer unlocks at Level 10 (Intermediate Grammar). "
                    f"You're currently Level {stats['level']} — basic topics below are still open to browse.")
 
+    topic_accuracy = db.grammar_topic_accuracy()
+    if topic_accuracy:
+        weakest_topic = min(topic_accuracy, key=lambda t: topic_accuracy[t]["pct"])
+        weakest = topic_accuracy[weakest_topic]
+        if weakest["total"] >= 2:  # avoid over-reacting to a single lucky/unlucky answer
+            st.info(f"💡 Your weakest topic so far is **{weakest_topic}** "
+                    f"({weakest['pct']:.0f}% correct, {weakest['correct']}/{weakest['total']}) — "
+                    f"worth another look below.", icon="🎯")
+
+    if "grammar_answered" not in st.session_state:
+        st.session_state.grammar_answered = set()
+
     for topic, data in grammar.GRAMMAR_TREE.items():
         locked = stats["level"] < data["min_level"] and not levels.is_unlocked("Intermediate Grammar", stats["level"])
-        with st.expander(f"{'🔒 ' if locked else ''}{topic}", expanded=False):
+        topic_stat = topic_accuracy.get(topic)
+        badge = f" — {topic_stat['pct']:.0f}%" if topic_stat else ""
+        with st.expander(f"{'🔒 ' if locked else ''}{topic}{badge}", expanded=False):
             if locked:
                 st.caption(f"Unlocks at Level {data['min_level']}.")
                 continue
@@ -870,10 +1134,20 @@ elif page == "📝 Grammar Explorer":
             for qi, q in enumerate(data["quiz"]):
                 choice = st.radio(q["q"], q["options"], key=f"grammar_{topic}_{qi}", index=None)
                 if choice is not None:
-                    if choice == q["correct"]:
+                    is_correct = choice == q["correct"]
+                    if is_correct:
                         st.success("Correct!")
                     else:
                         st.error(f"Not quite — the answer is **{q['correct']}**")
+
+                    answer_key = f"{topic}_{qi}"
+                    if answer_key not in st.session_state.grammar_answered:
+                        st.session_state.grammar_answered.add(answer_key)
+                        xp_earned = 8 if is_correct else 3
+                        db.record_quiz("grammar", topic, 1 if is_correct else 0, 1, xp_earned)
+                        db.add_xp(xp_earned, "grammar_explorer")
+                        week_start = (dt.date.today() - dt.timedelta(days=dt.date.today().weekday())).isoformat()
+                        db.bump_weekly_progress(week_start, "earn_xp", xp_earned)
 
 
 # ----------------------------------------------------------------------------
@@ -1086,7 +1360,7 @@ elif page == "💬 AI Chat":
         st.warning("Add your Gemini API key in the sidebar to use AI Chat.")
     else:
         roleplay_unlocked = levels.is_unlocked("AI Roleplay", stats["level"])
-        available_scenarios = list(gt.SCENARIOS.keys()) if roleplay_unlocked else ["Restaurant", "Ordering Coffee", "Shopping"]
+        available_scenarios = list(gt.SCENARIOS.keys()) if roleplay_unlocked else gt.BASIC_SCENARIOS
         if not roleplay_unlocked:
             st.caption(f"Basic scenarios unlocked. Full AI Roleplay (all scenarios) unlocks at Level 20 "
                        f"— you're Level {stats['level']}.")
@@ -1324,6 +1598,71 @@ elif page == "📊 Statistics":
 
 
 # ----------------------------------------------------------------------------
+# PAGE: Personal Records
+# ----------------------------------------------------------------------------
+elif page == "🏅 Personal Records":
+    st.markdown("## 🏅 Personal Records")
+    st.caption("Your own bests — a real global leaderboard isn't honest without other real "
+               "players, so this is about beating your own history instead.")
+
+    records = db.personal_records()
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        card_start()
+        st.markdown("#### 🔥 Longest Streak")
+        st.markdown(f"# {records['longest_streak']}")
+        st.caption("days")
+        card_end()
+    with c2:
+        card_start()
+        st.markdown("#### 🪙 Peak Coins")
+        st.markdown(f"# {records['peak_coins']:,}")
+        st.caption("most ever held at once")
+        card_end()
+    with c3:
+        card_start()
+        st.markdown("#### 📦 Chests Opened")
+        st.markdown(f"# {records['total_chests_opened']}")
+        st.caption("lifetime total")
+        card_end()
+
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        card_start()
+        st.markdown("#### ⚡ Best Day (XP)")
+        st.markdown(f"# {records['best_day_xp']:,}")
+        st.caption(records["best_day_xp_date"] or "No data yet")
+        card_end()
+    with c5:
+        card_start()
+        st.markdown("#### 📅 Best Week (XP)")
+        st.markdown(f"# {records['best_week_xp']:,}")
+        st.caption(f"week of {records['best_week_xp_start']}" if records["best_week_xp_start"] else "No data yet")
+        card_end()
+    with c6:
+        card_start()
+        st.markdown("#### 📖 Stories Completed")
+        st.markdown(f"# {records['total_stories_completed']}")
+        st.caption(f"out of {len(stories.STORIES)} available")
+        card_end()
+
+    c7, c8 = st.columns(2)
+    with c7:
+        card_start()
+        st.markdown("#### 📝 Most Quizzes in a Day")
+        st.markdown(f"# {records['most_quizzes_in_a_day']}")
+        st.caption(records["most_quizzes_in_a_day_date"] or "No data yet")
+        card_end()
+    with c8:
+        card_start()
+        st.markdown("#### 🌲 Most Immersion Hours in a Day")
+        st.markdown(f"# {records['most_immersion_hours_in_a_day']}")
+        st.caption(records["most_immersion_hours_in_a_day_date"] or "No data yet")
+        card_end()
+
+
+# ----------------------------------------------------------------------------
 # PAGE: Weekly Challenges
 # ----------------------------------------------------------------------------
 elif page == "🎯 Weekly Challenges":
@@ -1425,13 +1764,126 @@ elif page == "💰 Wallet":
                         db.register_coin_activity_play()
                         if opt == q["correct"]:
                             db.add_coins(5)
-                            play_sound("coin", profile.get("sound_enabled", "1") == "1")
+                            play_sound("coin", profile.get("sound_enabled", "1") == "1", pack=sound_pack_key(profile))
                             st.success(f"Richtig! +5 🪙")
                         else:
                             st.error(f"Nope — it's **{q['correct']} {q['noun']}**")
                         st.session_state.wallet_flip_q = None
                         st.rerun()
             card_end()
+
+
+# ----------------------------------------------------------------------------
+# PAGE: Listening Practice
+# ----------------------------------------------------------------------------
+elif page == "🎧 Listening Practice":
+    st.markdown("## 🎧 Listening Practice")
+
+    if not levels.is_unlocked("Listening Practice", stats["level"]):
+        st.warning(f"🔒 Listening Practice unlocks at Level 15. You're currently Level {stats['level']}.")
+    else:
+        st.caption(
+            "Uses your browser's built-in text-to-speech (no audio files) — click 🔊 Play Audio "
+            "on each question. Difficulty increases as you level up (B1 at Level 25, B2 at Level 35)."
+        )
+
+        exercise_labels = {
+            "Fill in the Blank": "blank",
+            "Translate": "translate",
+            "Listen & Identify": "identify",
+        }
+        exercise_label = st.selectbox("Exercise Type", list(exercise_labels.keys()), key="listening_exercise_select")
+        exercise_type = exercise_labels[exercise_label]
+
+        if "listening_game" not in st.session_state:
+            st.session_state.listening_game = None
+
+        game = st.session_state.listening_game
+        needs_new_round = game is None or game.get("exercise_type") != exercise_type
+
+        if needs_new_round:
+            if st.button("Start Round (5 sentences)", type="primary"):
+                pool = lc.sentences_for_level(stats["level"])
+                rng = random.Random()
+                chosen = rng.sample(pool, min(5, len(pool)))
+                st.session_state.listening_game = {
+                    "exercise_type": exercise_type, "sentences": chosen, "index": 0, "score": 0,
+                }
+                st.rerun()
+        else:
+            idx = game["index"]
+            if idx < len(game["sentences"]):
+                sentence = game["sentences"][idx]
+                card_start()
+                st.markdown(f"**Sentence {idx+1}/{len(game['sentences'])}** · {sentence['level']}")
+
+                if exercise_type == "blank":
+                    display_text = sentence["text"].replace(sentence["blank_word"], "____")
+                    st.markdown(f"### {display_text}")
+                    speak_german(sentence["text"], key_suffix=f"blank_{idx}")
+                    options = sentence["blank_options"]
+                    prompt = "Which word fills the blank?"
+                elif exercise_type == "translate":
+                    st.markdown("### 🔊 Listen and choose the correct translation")
+                    speak_german(sentence["text"], key_suffix=f"translate_{idx}")
+                    rng2 = random.Random(sentence["id"])
+                    distractors = rng2.sample(
+                        [s["translation"] for s in lc.SENTENCES if s["id"] != sentence["id"]],
+                        min(3, len(lc.SENTENCES) - 1),
+                    )
+                    options = [sentence["translation"]] + distractors
+                    rng2.shuffle(options)
+                    prompt = "Translation:"
+                else:  # identify
+                    st.markdown("### 🔊 Listen and choose the sentence you heard")
+                    speak_german(sentence["text"], key_suffix=f"identify_{idx}")
+                    options = list(sentence["similar_sentences"])
+                    random.Random(sentence["id"] + "_shuffle").shuffle(options)
+                    prompt = "Which sentence did you hear?"
+
+                choice = st.radio(prompt, options, key=f"listening_choice_{idx}", index=None)
+                if st.button("Submit", key=f"listening_submit_{idx}"):
+                    if choice is None:
+                        st.warning("Pick an answer first!")
+                    else:
+                        correct_answer = (
+                            sentence["blank_word"] if exercise_type == "blank"
+                            else sentence["translation"] if exercise_type == "translate"
+                            else sentence["text"]
+                        )
+                        is_correct = choice == correct_answer
+                        if is_correct:
+                            game["score"] += 1
+                            st.success("Richtig!")
+                            play_sound("correct", profile.get("sound_enabled", "1") == "1", pack=sound_pack_key(profile))
+                        else:
+                            st.error(f"Not quite — the answer was: **{correct_answer}**")
+                            play_sound("incorrect", profile.get("sound_enabled", "1") == "1", pack=sound_pack_key(profile))
+                        game["index"] += 1
+                        st.rerun()
+                card_end()
+            else:
+                score, total = game["score"], len(game["sentences"])
+                pct = score / total if total else 0
+                xp_earned = int(25 * total * pct) + (10 if pct == 1.0 else 0)
+                base_coins = int(6 * total * pct)
+                db.record_quiz("listening", exercise_type, score, total, xp_earned)
+                db.add_xp(xp_earned, "listening_practice")
+                breakdown = award_lesson_coins(base_coins)
+                week_start = (dt.date.today() - dt.timedelta(days=dt.date.today().weekday())).isoformat()
+                db.bump_weekly_progress(week_start, "earn_xp", xp_earned)
+
+                card_start()
+                st.markdown(f"## Round Complete! {score}/{total}")
+                st.markdown(f"**{xp_gain_display(xp_earned, profile)}**")
+                st.caption(coin_breakdown_caption(breakdown))
+                if pct == 1.0:
+                    st.success("🎉 Perfect score!")
+                    confetti_burst(120)
+                if st.button("Play Again"):
+                    st.session_state.listening_game = None
+                    st.rerun()
+                card_end()
 
 
 # ----------------------------------------------------------------------------
@@ -1463,7 +1915,7 @@ elif page == "🛍️ Shop":
                 if item["id"] in owned:
                     st.caption("Owned ✅")
                 elif st.button("Buy", key=f"buy_daily_{item['id']}", width='stretch'):
-                    _buy_item(item["id"], discounted_price, profile.get("sound_enabled", "1") == "1")
+                    _buy_item(item["id"], discounted_price, profile.get("sound_enabled", "1") == "1", pack=sound_pack_key(profile))
                 card_end()
 
     with tab2:
@@ -1488,7 +1940,7 @@ elif page == "🛍️ Shop":
                 if item["id"] in owned:
                     st.caption("Owned ✅")
                 elif st.button("Buy", key=f"buy_cat_{item['id']}", width='stretch'):
-                    _buy_item(item["id"], item["price"], profile.get("sound_enabled", "1") == "1")
+                    _buy_item(item["id"], item["price"], profile.get("sound_enabled", "1") == "1", pack=sound_pack_key(profile))
                 card_end()
 
     with tab3:
@@ -1503,7 +1955,7 @@ elif page == "🛍️ Shop":
                 if st.button("Buy Key", key=f"buy_key_{key_type}", width='stretch'):
                     if db.spend_coins(price):
                         db.add_keys(key_type, 1)
-                        play_sound("coin", profile.get("sound_enabled", "1") == "1")
+                        play_sound("coin", profile.get("sound_enabled", "1") == "1", pack=sound_pack_key(profile))
                         st.rerun()
                     else:
                         st.error("Not enough coins!")
@@ -1528,7 +1980,7 @@ elif page == "🛍️ Shop":
                     if item["id"] in owned:
                         st.caption("Owned ✅")
                     elif st.button("Buy", key=f"buy_seasonal_{item['id']}", width='stretch'):
-                        _buy_item(item["id"], item["price"], profile.get("sound_enabled", "1") == "1")
+                        _buy_item(item["id"], item["price"], profile.get("sound_enabled", "1") == "1", pack=sound_pack_key(profile))
                     card_end()
 
         st.markdown("#### All Seasonal Themes")
@@ -1597,7 +2049,7 @@ elif page == "📦 Loot Chests":
         st.markdown(rarity_span(won_item["rarity"], won_item["rarity"].upper()), unsafe_allow_html=True)
         card_end()
         confetti_burst(200 if won_item["rarity"] == "legendary" else 100)
-        play_sound("unlock", profile.get("sound_enabled", "1") == "1")
+        play_sound("unlock", profile.get("sound_enabled", "1") == "1", pack=sound_pack_key(profile))
 
         if st.button("Awesome!"):
             del st.session_state["opening_chest"]
@@ -1622,6 +2074,7 @@ elif page == "🧑‍🎨 Avatar":
         ("Frame", "avatar_frame", "equipped_avatar_frame"),
         ("Title", "title", "equipped_title"),
         ("XP Effect", "xp_effect", "equipped_xp_effect"),
+        ("Sound Pack", "sound_pack", "equipped_sound_pack"),
     ]
 
     preview_col, slots_col = st.columns([1, 2])
