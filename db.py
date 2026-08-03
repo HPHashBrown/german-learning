@@ -150,6 +150,9 @@ DEFAULT_PROFILE = {
     "legendary_keys": "0",
     "coin_activity_date": "",
     "coin_activity_count": "0",
+    "peak_coins": "100",
+    "equipped_sound_pack": "sound_classic",
+    "verb_trainer_best_streak": "0",
 }
 
 
@@ -179,6 +182,10 @@ def init_db():
         conn.execute(
             "INSERT OR IGNORE INTO inventory (item_id, item_type, rarity, acquired_at, acquired_via) "
             "VALUES ('xp_normal', 'xp_effect', 'common', ?, 'starter')", (dt.datetime.now().isoformat(),)
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO inventory (item_id, item_type, rarity, acquired_at, acquired_via) "
+            "VALUES ('sound_classic', 'sound_pack', 'common', ?, 'starter')", (dt.datetime.now().isoformat(),)
         )
 
 
@@ -215,6 +222,9 @@ def add_coins(amount: int):
     coins = int(float(profile.get("coins", "0") or 0)) + amount
     coins = max(0, coins)
     set_profile("coins", coins)
+    peak = int(float(profile.get("peak_coins", "0") or 0))
+    if coins > peak:
+        set_profile("peak_coins", coins)
     return coins
 
 
@@ -345,6 +355,78 @@ def get_quiz_results():
     import pandas as pd
     with get_conn() as conn:
         return pd.read_sql_query("SELECT * FROM quiz_results ORDER BY created_at DESC", conn)
+
+
+def personal_records() -> dict:
+    """Aggregates 'beat your own record' style personal bests from real
+    logged data — no fabricated leaderboard, just your own history."""
+    import pandas as pd
+    profile = get_profile()
+
+    records = {
+        "longest_streak": int(profile.get("longest_streak", "0") or 0),
+        "peak_coins": int(float(profile.get("peak_coins", "0") or 0)),
+        "best_day_xp": 0, "best_day_xp_date": None,
+        "best_week_xp": 0, "best_week_xp_start": None,
+        "most_quizzes_in_a_day": 0, "most_quizzes_in_a_day_date": None,
+        "most_immersion_hours_in_a_day": 0.0, "most_immersion_hours_in_a_day_date": None,
+        "total_chests_opened": 0,
+        "total_stories_completed": 0,
+    }
+
+    xp_log = get_xp_log()
+    if not xp_log.empty:
+        by_day = xp_log.groupby("date")["amount"].sum()
+        best_day = by_day.idxmax()
+        records["best_day_xp"] = int(by_day.max())
+        records["best_day_xp_date"] = best_day
+
+        xp_log2 = xp_log.copy()
+        xp_log2["date"] = pd.to_datetime(xp_log2["date"])
+        xp_log2["week_start"] = (xp_log2["date"] - pd.to_timedelta(xp_log2["date"].dt.weekday, unit="D"))
+        by_week = xp_log2.groupby("week_start")["amount"].sum()
+        best_week = by_week.idxmax()
+        records["best_week_xp"] = int(by_week.max())
+        records["best_week_xp_start"] = best_week.date().isoformat()
+
+    quiz_df = get_quiz_results()
+    if not quiz_df.empty:
+        by_day_count = quiz_df.groupby("date").size()
+        best_quiz_day = by_day_count.idxmax()
+        records["most_quizzes_in_a_day"] = int(by_day_count.max())
+        records["most_quizzes_in_a_day_date"] = best_quiz_day
+
+    imm_df = get_immersion_sessions()
+    if not imm_df.empty:
+        imm_by_day = imm_df.groupby(imm_df["date"].dt.date)["hours"].sum()
+        best_imm_day = imm_by_day.idxmax()
+        records["most_immersion_hours_in_a_day"] = round(float(imm_by_day.max()), 2)
+        records["most_immersion_hours_in_a_day_date"] = best_imm_day.isoformat()
+
+    records["total_chests_opened"] = len(get_chest_history())
+
+    story_progress = get_story_progress()
+    records["total_stories_completed"] = sum(1 for v in story_progress.values() if v["completed"])
+
+    return records
+
+
+def grammar_topic_accuracy():
+    """Returns {topic: {'correct': n, 'total': n, 'pct': float}} from every
+    recorded grammar mini-quiz answer, or {} if none recorded yet."""
+    import pandas as pd
+    with get_conn() as conn:
+        df = pd.read_sql_query(
+            "SELECT category, score, total FROM quiz_results WHERE quiz_type = 'grammar'", conn,
+        )
+    if df.empty:
+        return {}
+    grouped = df.groupby("category").agg(correct=("score", "sum"), total=("total", "sum"))
+    result = {}
+    for topic, row in grouped.iterrows():
+        pct = (row["correct"] / row["total"] * 100) if row["total"] else 0
+        result[topic] = {"correct": int(row["correct"]), "total": int(row["total"]), "pct": round(pct, 1)}
+    return result
 
 
 # --------------------------------------------------------------- stories --
