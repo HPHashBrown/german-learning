@@ -159,6 +159,30 @@ def remove_building(world_id: str, x: int, y: int):
         )
 
 
+def relocate_building(world_id: str, from_x: int, from_y: int, to_x: int, to_y: int):
+    """Moves a building (preserving its current level) from one tile to
+    another in a single transaction. Caller is responsible for validating
+    the move beforehand (target unlocked+empty, terrain requirements, etc.)."""
+    with maindb.get_conn() as conn:
+        source = conn.execute(
+            "SELECT building_id, building_level FROM town_tiles WHERE world_id=? AND x=? AND y=?",
+            (world_id, from_x, from_y),
+        ).fetchone()
+        if not source or not source["building_id"]:
+            return False
+        conn.execute(
+            "UPDATE town_tiles SET building_id=NULL, building_level=0 "
+            "WHERE world_id=? AND x=? AND y=?",
+            (world_id, from_x, from_y),
+        )
+        conn.execute(
+            "UPDATE town_tiles SET building_id=?, building_level=? "
+            "WHERE world_id=? AND x=? AND y=?",
+            (source["building_id"], source["building_level"], world_id, to_x, to_y),
+        )
+        return True
+
+
 def upgrade_building(world_id: str, x: int, y: int, new_level: int):
     with maindb.get_conn() as conn:
         conn.execute(
@@ -172,6 +196,14 @@ def place_decoration(world_id: str, x: int, y: int, decoration_id: str):
         conn.execute(
             "UPDATE town_tiles SET decoration_id=? WHERE world_id=? AND x=? AND y=?",
             (decoration_id, world_id, x, y),
+        )
+
+
+def remove_decoration(world_id: str, x: int, y: int):
+    with maindb.get_conn() as conn:
+        conn.execute(
+            "UPDATE town_tiles SET decoration_id=NULL WHERE world_id=? AND x=? AND y=?",
+            (world_id, x, y),
         )
 
 
