@@ -26,7 +26,19 @@ SCENARIOS = {
     "Doctor": "You are a German doctor (Hausarzt) talking with a patient about mild symptoms.",
     "Friends": "You are the user's German friend, chatting casually about weekend plans.",
     "Ordering Coffee": "You are a barista at a German café taking a coffee order.",
+    "Pharmacy": "You are a pharmacist (Apotheker/in) in Germany helping a customer choose an over-the-counter remedy.",
+    "Post Office": "You are a clerk at a German Post office (Deutsche Post) helping someone send a package.",
+    "Bank": "You are a bank employee in Germany helping a customer open an account or ask about their finances.",
+    "Apartment Hunting": "You are a landlord (Vermieter/in) showing a prospective tenant around a German apartment.",
+    "Public Transport": "You are a stranger on a German train/bus platform helping a confused traveler figure out which line to take.",
+    "Tech Support": "You are a German-speaking tech support agent helping a customer troubleshoot an internet/phone problem.",
+    "Making Small Talk": "You are a fellow guest at a German house party, making casual small talk with someone you just met.",
+    "Returning a Product": "You are a customer service employee at a German electronics store, handling a product return/complaint.",
 }
+
+# Scenarios available before the Level 20 "AI Roleplay" unlock — kept small
+# and low-stakes; the rest unlock as a genuine content expansion at Level 20.
+BASIC_SCENARIOS = ["Restaurant", "Ordering Coffee", "Shopping"]
 
 CONVERSATION_SYSTEM_TEMPLATE = """You are a German conversation partner for a language learner, roleplaying
 this scenario: {scenario_desc}
