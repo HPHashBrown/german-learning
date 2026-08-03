@@ -77,13 +77,26 @@ def can_build(world_id: str, x: int, y: int, building_id: str, player_level: int
         return False, "Tile does not exist."
     if tile["locked"]:
         return False, "Tile is still locked."
-    if tile["building_id"]:
-        return False, "Tile already has a building."
     building = cfg.BUILDINGS.get(building_id)
     if not building:
         return False, "Unknown building."
     if player_level < building.min_player_level:
         return False, f"Requires Player Level {building.min_player_level}."
+
+    if building.category == "decoration":
+        # Decorations live in their own slot (decoration_id) and can coexist
+        # with a regular building on the same tile — they never compete for
+        # the building slot.
+        if tile["decoration_id"]:
+            return False, "Tile already has a decoration."
+        return True, ""
+
+    if tile["building_id"]:
+        return False, "Tile already has a building."
+    if building.required_terrain and tile["terrain_id"] != building.required_terrain:
+        terrain = cfg.TERRAIN_TYPES.get(building.required_terrain)
+        terrain_name = terrain.name if terrain else building.required_terrain
+        return False, f"{building.name} can only be built on {terrain_name} terrain."
     return True, ""
 
 
@@ -104,13 +117,17 @@ def effective_upgrade_cost(world_id: str, building: cfg.Building, current_level:
 def build(world_id: str, x: int, y: int, building_id: str, player_level: int) -> tuple[bool, str, int]:
     """Returns (success, message, coin_cost_charged). Caller is responsible
     for actually deducting coins from the player's wallet — this function
-    only validates and, on success, writes the tile."""
+    only validates and, on success, writes the tile. Decorations are routed
+    to the independent decoration_id slot rather than building_id."""
     ok, reason = can_build(world_id, x, y, building_id, player_level)
     if not ok:
         return False, reason, 0
     building = cfg.BUILDINGS[building_id]
     cost = effective_build_cost(world_id, building)
-    tdb.place_building(world_id, x, y, building_id)
+    if building.category == "decoration":
+        tdb.place_decoration(world_id, x, y, building_id)
+    else:
+        tdb.place_building(world_id, x, y, building_id)
     return True, f"Built {building.name}!", cost
 
 
@@ -143,6 +160,45 @@ def upgrade(world_id: str, x: int, y: int, player_level: int) -> tuple[bool, str
     return True, f"{building_name} upgraded to level {new_level}!", cost
 
 
+# ---------------------------------------------------------------- Moving ---
+def move_cost(building: cfg.Building) -> int:
+    return max(1, round(building.build_cost() * cfg.MOVE_COST_PCT))
+
+
+def can_move_to(world_id: str, from_x: int, from_y: int, to_x: int, to_y: int) -> tuple[bool, str]:
+    source = tdb.get_tile(world_id, from_x, from_y)
+    if not source or not source["building_id"]:
+        return False, "No building to move here."
+    building = cfg.BUILDINGS.get(source["building_id"])
+    if building is None:
+        return False, "Unknown building type — can't move it."
+
+    dest = tdb.get_tile(world_id, to_x, to_y)
+    if not dest:
+        return False, "Destination tile does not exist."
+    if dest["locked"]:
+        return False, "Destination tile is still locked."
+    if dest["building_id"]:
+        return False, "Destination tile already has a building."
+    if building.required_terrain and dest["terrain_id"] != building.required_terrain:
+        terrain = cfg.TERRAIN_TYPES.get(building.required_terrain)
+        return False, f"{building.name} can only be placed on {terrain.name if terrain else building.required_terrain} terrain."
+    return True, ""
+
+
+def move_building(world_id: str, from_x: int, from_y: int, to_x: int, to_y: int) -> tuple[bool, str, int]:
+    """Returns (success, message, coin_cost). Caller deducts coins beforehand
+    the same way build()/upgrade() work — this only validates and writes."""
+    ok, reason = can_move_to(world_id, from_x, from_y, to_x, to_y)
+    if not ok:
+        return False, reason, 0
+    source = tdb.get_tile(world_id, from_x, from_y)
+    building = cfg.BUILDINGS[source["building_id"]]
+    cost = move_cost(building)
+    tdb.relocate_building(world_id, from_x, from_y, to_x, to_y)
+    return True, f"Moved {building.name} to ({to_x}, {to_y})!", cost
+
+
 # --------------------------------------------------------- Coin bonuses ----
 def _sum_effect(world_id: str, effect_type: str) -> float:
     df = tdb.all_buildings_in_world(world_id)
@@ -152,7 +208,10 @@ def _sum_effect(world_id: str, effect_type: str) -> float:
     for _, row in df.iterrows():
         building = cfg.BUILDINGS.get(row["building_id"])
         if building and building.effect_type == effect_type:
-            total += building.effect_at(int(row["building_level"]))
+            effect = building.effect_at(int(row["building_level"]))
+            if building.preferred_terrain and row["terrain_id"] == building.preferred_terrain:
+                effect *= cfg.PREFERRED_TERRAIN_BONUS_MULT
+            total += effect
     return total
 
 
