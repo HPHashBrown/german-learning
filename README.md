@@ -60,6 +60,9 @@ general engineering approach (SQLite persistence, tested interaction flows).
   second unlock gate onto already-working, already-tested content pages carried more
   regression risk than benefit in this pass, so it's a clean, ready-to-use hook rather than
   a half-integrated feature.
+- **Locked Buildings preview**: the Town page has a "🔒 Locked Buildings" expander showing
+  every building you haven't unlocked yet, grouped by category, with the exact Player Level
+  and remaining XP needed for each — so you can see what's coming before you get there.
 - **Currency system**: coins, separate from XP, earned from quizzes/stories/challenges,
   spendable only on cosmetics (themes, avatar parts, pets, decorations, XP effects, titles)
   — never on anything that affects learning power.
@@ -118,6 +121,60 @@ general engineering approach (SQLite persistence, tested interaction flows).
 - **Persistence**: everything lives in SQLite (`fluent_forest_rpg.db`), autosaves on every
   action, survives restarts. Full JSON backup export in Settings.
 
+## Latest additions (this round)
+
+- **Equipped Title** now shows on the Home page header next to your name.
+- **Terrain-specific buildings**: Water Mill (requires River), Lumber Mill (requires Forest),
+  Stone Quarry (requires Rocky Ground) — hard terrain gates — and Farm (+50% effect on
+  Grassland) — a soft bonus. The Build panel shows terrain requirements/bonuses per building
+  and disables ones that can't go on the selected tile, with a clear explanation why.
+- **Building relocation**: a "🚚 Move" button on any built tile starts a guided
+  "click an empty tile to place it there" flow, costs 50% of the building's original build
+  cost, preserves its current level, and safely rolls back (no ghost buildings, no lost
+  coins) if you cancel or can't afford it.
+- **Decorations now layer independently from buildings** — they use the `decoration_id`
+  column that already existed in the schema but was unused; a tile can hold one building
+  *and* one decoration at the same time, each with its own occupancy rule. The grid shows
+  both together (e.g. 🥐🌳), and decorations are placed either from the Build panel (on
+  empty tiles) or a dedicated section in the Upgrade panel (on tiles that already have a
+  building).
+- **Building visual evolution**: a building's emoji can now change at higher levels (e.g.
+  Bakery 🥐 → 🍞 → 🏪, House 🏠 → 🏡 → 🏘️, Farm 🌻 → 🌾 → 🚜, Library 📚 → 🏛️) via an
+  `emoji_override` on specific `BuildingLevel` tiers — added to five representative
+  buildings; the pattern is data-driven so more can be added with a one-line change per tier.
+- **Town snapshot download**: a "📸 Snapshot" button renders the current town grid to a PNG
+  (via Pillow, pure Python) and offers it as a download. Deliberately uses colored tiles +
+  short text labels instead of literal emoji glyphs, since color-emoji font support isn't
+  guaranteed across deployment environments (including Streamlit Cloud) — this renders
+  identically everywhere.
+- **3 new C1 stories**, gated behind Level 40 (the "Native Stories" unlock) rather than the
+  general Level 3 "Reading Stories" gate the other 16 stories use.
+- **AI Chat scenarios expanded from 8 to 16** — Pharmacy, Post Office, Bank, Apartment
+  Hunting, Public Transport, Tech Support, Small Talk, Returning a Product — so hitting the
+  Level 20 "AI Roleplay" unlock roughly doubles your options, a real content expansion.
+- **Weakest grammar topic tracker**: Grammar Explorer mini-quizzes now actually get recorded
+  (they didn't before — no XP, no tracking) and award small XP per question. A banner at the
+  top surfaces your weakest topic by accuracy once you've answered at least 2 questions in
+  it, and each topic's expander shows its running accuracy.
+- **Personal Records page**: longest streak, peak coins ever held, best single day/week for
+  XP, most quizzes in a day, most immersion hours in a day, stories completed, chests
+  opened — all computed from real logged history. No fake leaderboard; genuinely "beat your
+  own record."
+- **Sound packs**: two purchasable alternates (Chiptune, Soft Chimes) alongside the
+  starter-owned Classic pack, each with a distinct tone character across all 7 sound events.
+  Equip via the Avatar page's new "Sound Pack" slot.
+- **Verb Trainer**: added Speed Round (60-second time budget, unlimited questions within it)
+  and Infinite Streak (keep going until you miss one, tracks your personal best streak)
+  alongside the original Standard 10-question mode. Honest note: without JavaScript there's
+  no live-ticking visual countdown in Speed Round — the remaining-time estimate updates each
+  time you submit an answer rather than ticking every second, which is disclosed directly in
+  the UI rather than faking a smoother experience than what Streamlit can actually do.
+- **Listening Practice** (finally a real page behind the Level 15 unlock label): uses the
+  browser's built-in text-to-speech (Web Speech API, German voice, no audio files) with three
+  exercise types — Fill in the Blank, Translate, and Listen & Identify (pick which of several
+  similar written sentences matches what you heard). 13 sentences across A1–B2, with B1/B2
+  gated behind Level 25/35 so difficulty genuinely increases as you progress.
+
 ## Honestly descoped or simplified (and why)
 
 - **100 stories → 16 stories.** Writing 100 original, grammatically correct short stories
@@ -169,7 +226,9 @@ Pronunciation Trainer — everything else works with zero API keys.
 - `daily_extras.py` — idiom / DACH fact / quote of the day
 - `town_config.py` — town system config: terrain, buildings, worlds, challenge tiers (data-driven)
 - `town_db.py` — town system persistence (same SQLite file, its own tables)
-- `town_engine.py` — town system pure game logic (grid, adjacency, building, coin bonuses)
+- `town_engine.py` — town system pure game logic (grid, adjacency, building, coin bonuses, moving)
+- `town_snapshot.py` — renders the town grid to a downloadable PNG (Pillow, no JS)
+- `listening_content.py` — sentence bank for the Listening Practice page
 - `tile_challenge.py` — generates tile-claim challenges by reusing existing quiz/grammar content
 - `gemini_tools.py` — Gemini API integration (chat, writing tutor, pronunciation, dictionary)
 - `achievements.py` — Trophy Room achievement definitions
